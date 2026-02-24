@@ -1,0 +1,90 @@
+# ============================================================
+# Web VLA Agent — Default Configuration (CPU-Optimized Refactor)
+# ============================================================
+
+model:
+  text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
+  vision_encoder: "openai/clip-vit-base-patch32"
+  text_dim: 384
+  vision_dim: 512
+  hidden_dim: 256
+  num_action_types: 4
+
+graph:
+  gcn_layers: 1
+  structural_dim: 36
+  dropout: 0.1
+
+grounder:
+  cross_attention_layers: 1
+  num_heads: 4
+  dropout: 0.1
+  contrastive_temperature: 0.07
+
+uncertainty:
+  entropy_threshold: 1.5         # Auto-calibrated from validation 90th percentile
+  temperature: 0.07
+
+training:
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  batch_size: 8
+  num_epochs: 50
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  # 3-term loss: L = λ₁·L_CE_elem + λ₂·L_InfoNCE + λ₃·L_CE_action
+  lambda_element: 1.0
+  lambda_contrastive: 0.5       # Risk 1: reduce to 0.2 if InfoNCE stagnates
+  lambda_action: 1.0
+  # Focal loss for action collapse fix
+  focal_gamma: 2.0              # Risk 2: reduce to 1.0 or 0.0 if unstable
+  # 3-phase schedule
+  phase1_epochs: 10             # Grounding stabilization
+  phase2_epochs: 30             # Joint grounding + action (cumulative)
+  # Phase 3 = remaining epochs (entropy replanning)
+  # Phase transition thresholds
+  phase1_element_acc_threshold: 0.30
+  phase2_element_acc_threshold: 0.50
+  phase2_action_acc_threshold: 0.70
+  save_every_n_epochs: 5
+  checkpoint_dir: "checkpoints"
+  seed: 42
+
+evaluation:
+  long_horizon_threshold: 5
+  splits: ["test_task", "test_website", "test_domain"]
+
+# Planner — EVALUATION ONLY (excluded from training)
+planner:
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
+  max_subgoals: 10
+  max_retries: 3
+  temperature: 0.3
+  max_new_tokens: 1024
+
+memory:
+  short_term_capacity: 5
+  max_retries_per_subgoal: 3
+  loop_detection_window: 4
+  stale_state_threshold: 3
+
+environment:
+  headless: true
+  viewport_width: 1280
+  viewport_height: 720
+  timeout_ms: 30000
+  screenshot_width: 1280
+  screenshot_height: 720
+
+data:
+  dataset_name: "osunlp/Multimodal-Mind2Web"
+  max_dom_elements: 128
+  max_action_history: 5
+  screenshot_size: [224, 224]
+  html_max_tokens: 1024
+
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  use_wandb: false
+  wandb_project: "web-vla-agent"
