@@ -1,87 +1,75 @@
 # ============================================================
-# Web VLA Agent — Default Configuration (CPU-Optimized Refactor)
+# VLA Web Agent — Configuration (Multimodal Sequential VLM)
 # ============================================================
 
 model:
-  text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
-  vision_encoder: "openai/clip-vit-base-patch32"
-  text_dim: 384
-  vision_dim: 512
-  hidden_dim: 256
-  num_action_types: 4
+  # Multimodal VLM backbone
+  name: "Qwen/Qwen2-VL-2B-Instruct"
+  max_new_tokens: 256
+  temperature: 0.1
+  top_p: 0.9
+  repetition_penalty: 1.1
 
-graph:
-  gcn_layers: 1
-  structural_dim: 36
-  dropout: 0.1
+  # QLoRA configuration
+  use_qlora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  quantization_bits: 4
 
-grounder:
-  cross_attention_layers: 1
-  num_heads: 4
-  dropout: 0.1
-  contrastive_temperature: 0.07
-
-uncertainty:
-  entropy_threshold: 1.5         # Auto-calibrated from validation 90th percentile
-  temperature: 0.07
+  # Action types
+  action_types: ["CLICK", "TYPE", "SELECT", "SCROLL"]
 
 training:
+  # Stage 1: Single-step imitation
+  stage1_epochs: 5
+  # Stage 2: Multi-step imitation
+  stage2_epochs: 10
+  # Stage 3 (optional): RL fine-tuning
+  stage3_epochs: 0
+
   learning_rate: 2.0e-4
   weight_decay: 0.01
-  batch_size: 8
-  num_epochs: 50
+  batch_size: 4
+  gradient_accumulation_steps: 4
   warmup_ratio: 0.1
   max_grad_norm: 1.0
-  # 3-term loss: L = λ₁·L_CE_elem + λ₂·L_InfoNCE + λ₃·L_CE_action
-  lambda_element: 1.0
-  lambda_contrastive: 0.5       # Risk 1: reduce to 0.2 if InfoNCE stagnates
-  lambda_action: 1.0
-  # Focal loss for action collapse fix
-  focal_gamma: 2.0              # Risk 2: reduce to 1.0 or 0.0 if unstable
-  # 3-phase schedule
-  phase1_epochs: 10             # Grounding stabilization
-  phase2_epochs: 30             # Joint grounding + action (cumulative)
-  # Phase 3 = remaining epochs (entropy replanning)
-  # Phase transition thresholds
-  phase1_element_acc_threshold: 0.30
-  phase2_element_acc_threshold: 0.50
-  phase2_action_acc_threshold: 0.70
-  save_every_n_epochs: 5
-  checkpoint_dir: "checkpoints"
   seed: 42
 
-evaluation:
-  long_horizon_threshold: 5
-  splits: ["test_task", "test_website", "test_domain"]
+  # Mixed precision
+  fp16: false
+  bf16: true
 
-# Planner — EVALUATION ONLY (excluded from training)
-planner:
-  model_name: "Qwen/Qwen2.5-3B-Instruct"
-  max_subgoals: 10
-  max_retries: 3
-  temperature: 0.3
-  max_new_tokens: 1024
+  # Checkpointing
+  save_every_n_epochs: 1
+  checkpoint_dir: "checkpoints"
+  logging_steps: 10
 
-memory:
-  short_term_capacity: 5
-  max_retries_per_subgoal: 3
-  loop_detection_window: 4
-  stale_state_threshold: 3
+  # Dataset
+  max_seq_length: 4096
+
+data:
+  dataset_name: "osunlp/Multimodal-Mind2Web"
+  max_dom_nodes: 500
+  max_action_history: 10
+  max_text_per_node: 200
 
 environment:
   headless: true
   viewport_width: 1280
   viewport_height: 720
   timeout_ms: 30000
-  screenshot_width: 1280
-  screenshot_height: 720
+  max_steps: 30
 
-data:
-  dataset_name: "osunlp/Multimodal-Mind2Web"
-  max_dom_elements: 128
-  max_action_history: 5
-  screenshot_size: [224, 224]
-  html_max_tokens: 1024
+uncertainty:
+  # Token-level confidence
+  min_log_prob_threshold: -2.0   # average log-prob below this triggers regeneration
+  beam_width: 3                   # for beam disagreement
+  max_regenerations: 2            # max re-generation attempts
+
+evaluation:
+  splits: ["test_task", "test_website", "test_domain"]
 
 logging:
   level: "INFO"

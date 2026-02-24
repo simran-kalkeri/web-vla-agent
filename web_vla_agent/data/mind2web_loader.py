@@ -1,333 +1,492 @@
 """
-Multimodal-Mind2Web dataset loader — Candidate-Based.
+Multimodal-Mind2Web Dataset Loader — Full DOM (No Candidate Pools).
 
-Mind2Web uses a CANDIDATE-BASED approach:
-  - Each sample provides pos_candidates (1+) and neg_candidates (~50–600)
-  - The element pool = pos + neg (shuffled)
-  - Target = index of the positive candidate in the pool
-  - This guarantees 100% target match rate
+Loads the osunlp/Multimodal-Mind2Web dataset and builds training
+examples with:
+  - Task instruction
+  - Full serialized DOM (structured, not candidate-filtered)
+  - Screenshot (PIL Image)
+  - Ground-truth action JSON targets
+  - Action history for multi-step training
 
-Each candidate has: tag, attributes (JSON), backend_node_id, text content.
-We build element signatures from these for text encoding.
+NO candidate pool restriction.
+NO pos/neg filtered lists.
+Full DOM tree serialization.
 """
 from __future__ import annotations
 
 import json
-import random
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
-from data.preprocessing import DOMElement, BoundingBox
-from utils.config import DataConfig
+logger = logging.getLogger(__name__)
 
+# Mind2Web operation type mapping
+_OP_MAP = {
+    "CLICK": "CLICK",
+    "TYPE": "TYPE",
+    "SELECT": "SELECT",
+    "HOVER": "CLICK",     # map hover to click
+    "ENTER": "CLICK",     # map enter to click
+}
 
-# ── Structured sample ───────────────────────────────────────
 
 @dataclass
 class Mind2WebSample:
-    """A single processed Mind2Web training / evaluation sample."""
+    """A single training sample from Multimodal-Mind2Web."""
     sample_id: str = ""
-    annotation_id: str = ""
     task: str = ""
     website: str = ""
     domain: str = ""
-    operation: str = ""
-    value: str = ""
-    previous_actions: List[str] = field(default_factory=list)
-    trajectory_length: int = 1
+    subdomain: str = ""
 
-    # Candidate-based element pool
-    candidates: List[Dict[str, Any]] = field(default_factory=list)
-    target_idx: int = -1  # Index of positive candidate in pool
+    # DOM
+    raw_html: str = ""
+    cleaned_html: str = ""
+    serialized_dom: str = ""
 
+    # Screenshot
+    screenshot: Optional[Image.Image] = None
 
-# ── Operation / candidate parsing ────────────────────────────
+    # Ground-truth action
+    action: Dict[str, Any] = field(default_factory=dict)
+    action_repr: str = ""
 
-OPERATION_MAP = {"CLICK": 0, "TYPE": 1, "SELECT": 2, "SCROLL": 3}
-
-
-def parse_operation(op_raw: str) -> Tuple[str, str]:
-    """Parse the JSON operation field from Mind2Web."""
-    if not op_raw:
-        return ("CLICK", "")
-    try:
-        op_dict = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
-        operation = op_dict.get("op", op_dict.get("original_op", "CLICK"))
-        value = op_dict.get("value", "")
-        return (operation.upper(), value)
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        return ("CLICK", "")
+    # Trajectory context (for multi-step training)
+    action_history: List[Dict[str, Any]] = field(default_factory=list)
+    step_index: int = 0
+    trajectory_id: str = ""
 
 
-def parse_candidate(raw: Any) -> Optional[Dict[str, Any]]:
-    """Parse a single candidate JSON into a structured dict."""
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if not isinstance(raw, dict):
-        return None
-
-    tag = raw.get("tag", "div")
-    backend_node_id = str(raw.get("backend_node_id", ""))
-
-    # Parse nested attributes JSON
-    attrs_raw = raw.get("attributes", "{}")
-    if isinstance(attrs_raw, str):
-        try:
-            attrs = json.loads(attrs_raw)
-        except (json.JSONDecodeError, TypeError):
-            attrs = {}
-    else:
-        attrs = attrs_raw if isinstance(attrs_raw, dict) else {}
-
-    # If backend_node_id not at top level, try from attributes
-    if not backend_node_id:
-        backend_node_id = str(attrs.get("backend_node_id", ""))
-
-    # Extract useful text for signature
-    text = ""
-    for key in ["aria_label", "aria-label", "placeholder", "title", "alt", "value", "name"]:
-        v = attrs.get(key, "")
-        if v:
-            text = str(v)[:120]
-            break
-
-    # Inner text from the candidate
-    inner_text = str(raw.get("text", ""))[:120]
-    if inner_text and not text:
-        text = inner_text
-
-    # Build signature: "tag | text | key-attrs"
-    attr_parts = []
-    for k in ["id", "class", "role", "type", "href"]:
-        v = attrs.get(k, "")
-        if v:
-            attr_parts.append(f'{k}="{str(v)[:60]}"')
-    attr_str = " ".join(attr_parts)
-
-    text_short = (text[:80] + "…") if len(text) > 80 else text
-    signature = f"{tag} | {text_short} | {attr_str}".strip(" |")
-
-    return {
-        "tag": tag,
-        "backend_node_id": backend_node_id,
-        "signature": signature,
-        "text": text,
-        "attributes": attrs,
-        "is_positive": raw.get("_is_positive", False),
-    }
+@dataclass
+class Mind2WebTrajectory:
+    """A full trajectory (multi-step) from Mind2Web."""
+    trajectory_id: str = ""
+    task: str = ""
+    website: str = ""
+    domain: str = ""
+    steps: List[Mind2WebSample] = field(default_factory=list)
 
 
-def build_candidate_pool(
-    pos_candidates: list,
-    neg_candidates: list,
-    max_candidates: int = 128,
-    shuffle: bool = True,
-) -> Tuple[List[Dict[str, Any]], int]:
+class Mind2WebLoader:
     """
-    Build element pool from pos + neg candidates.
-    Returns (pool, target_idx).
-    """
-    # Parse positive
-    positives = []
-    for c in pos_candidates:
-        parsed = parse_candidate(c)
-        if parsed:
-            parsed["_is_positive"] = True
-            positives.append(parsed)
+    Load Multimodal-Mind2Web dataset for VLA training.
 
-    # Parse negatives (cap to leave room for positives)
-    max_neg = max_candidates - len(positives)
-    negatives = []
-    for c in neg_candidates[:max_neg * 2]:  # parse extra in case some fail
-        if len(negatives) >= max_neg:
-            break
-        parsed = parse_candidate(c)
-        if parsed:
-            parsed["_is_positive"] = False
-            negatives.append(parsed)
+    Loads the full dataset (not sample-limited) and builds
+    training examples with full DOM serialization.
 
-    if not positives:
-        return negatives[:max_candidates], -1
-
-    # Combine
-    pool = positives + negatives
-    pool = pool[:max_candidates]
-
-    if shuffle:
-        random.shuffle(pool)
-
-    # Find target index
-    target_idx = -1
-    for i, c in enumerate(pool):
-        if c.get("_is_positive", False):
-            target_idx = i
-            break
-
-    return pool, target_idx
-
-
-# ── Candidate → DOMElement conversion (for GCN) ─────────────
-
-def candidates_to_dom_elements(candidates: List[Dict[str, Any]]) -> List[DOMElement]:
-    """Convert candidate dicts to DOMElement objects for structural features."""
-    elements = []
-    for i, c in enumerate(candidates):
-        attrs = c.get("attributes", {})
-        if isinstance(attrs, str):
-            try:
-                attrs = json.loads(attrs)
-            except:
-                attrs = {}
-
-        # Parse bounding box if available
-        bbox = None
-        bbox_str = attrs.get("bounding_box_rect", "")
-        if bbox_str:
-            try:
-                parts = [float(x) for x in str(bbox_str).split(",")[:4]]
-                if len(parts) == 4:
-                    bbox = BoundingBox(x=parts[0], y=parts[1], width=parts[2], height=parts[3])
-            except (ValueError, TypeError):
-                pass
-
-        tag = c.get("tag", "div")
-        is_clickable = tag in {"a", "button", "input", "select", "textarea", "option", "label"}
-
-        elem = DOMElement(
-            element_id=c.get("backend_node_id", f"cand_{i}"),
-            tag=tag,
-            text=c.get("text", "")[:256],
-            attributes={k: str(v)[:100] for k, v in attrs.items()
-                       if k in {"id", "class", "role", "type", "href", "name", "aria_label"}},
-            bounding_box=bbox,
-            is_clickable=is_clickable,
-            is_visible=True,
-            parent_id=None,
-            depth=0,
-        )
-        elements.append(elem)
-    return elements
-
-
-# ── PyTorch Dataset ──────────────────────────────────────────
-
-class Mind2WebDataset(Dataset):
-    """
-    Candidate-based Mind2Web dataset.
-    Element pool = pos_candidates + neg_candidates (shuffled).
-    Target = index of positive candidate in pool.
-    100% target match rate guaranteed.
+    Parameters
+    ----------
+    dataset_name : str
+        HuggingFace dataset identifier.
+    max_dom_nodes : int
+        Maximum DOM nodes to include in serialization.
+    max_text_per_node : int
+        Maximum text characters per node.
     """
 
     def __init__(
         self,
-        split: str = "train",
-        config: Optional[DataConfig] = None,
-        max_samples: Optional[int] = None,
-        max_candidates: int = 128,
+        dataset_name: str = "osunlp/Multimodal-Mind2Web",
+        max_dom_nodes: int = 500,
+        max_text_per_node: int = 200,
     ):
-        self.config = config or DataConfig()
-        self.split = split
-        self.max_candidates = max_candidates
+        self.dataset_name = dataset_name
+        self.max_dom_nodes = max_dom_nodes
+        self.max_text_per_node = max_text_per_node
 
+        # Lazy import
+        self._serializer = None
+
+    @property
+    def serializer(self):
+        if self._serializer is None:
+            from environment.dom_serializer import DOMSerializer
+            self._serializer = DOMSerializer(
+                max_nodes=self.max_dom_nodes,
+                max_text_len=self.max_text_per_node,
+            )
+        return self._serializer
+
+    def load_dataset(
+        self,
+        split: str = "train",
+        max_samples: Optional[int] = None,
+        streaming: bool = False,
+    ):
+        """
+        Load the raw HuggingFace dataset.
+
+        Parameters
+        ----------
+        split : str
+            Dataset split: 'train', 'test_task', 'test_website', 'test_domain'
+        max_samples : int, optional
+            Limit number of samples (None = full dataset).
+        streaming : bool
+            Use streaming mode for large datasets.
+        """
         from datasets import load_dataset
-        ds = load_dataset(self.config.dataset_name, split=split)
-        if max_samples is not None:
+
+        logger.info(f"Loading {self.dataset_name} split={split} streaming={streaming}")
+
+        if streaming:
+            ds = load_dataset(self.dataset_name, split=split, streaming=True)
+        else:
+            ds = load_dataset(self.dataset_name, split=split)
+
+        if max_samples and not streaming:
             ds = ds.select(range(min(max_samples, len(ds))))
-        self._dataset = ds
 
-    def __len__(self) -> int:
-        return len(self._dataset)
+        return ds
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row = self._dataset[idx]
-        return self._process_row(row)
+    def process_sample(
+        self,
+        raw_sample: Dict[str, Any],
+        include_screenshot: bool = True,
+    ) -> Mind2WebSample:
+        """
+        Process a single raw dataset sample into a Mind2WebSample.
 
-    def _process_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        # Operation
-        op_raw = row.get("operation", "") or ""
-        operation, value = parse_operation(op_raw)
-        op_label = OPERATION_MAP.get(operation, 0)
+        Extracts:
+          - Task instruction from confirmed_task
+          - Serialized DOM from cleaned_html (full, not candidate-filtered)
+          - Screenshot from the screenshot field
+          - Ground-truth action from operation + pos_candidates
+        """
+        sample_id = raw_sample.get("annotation_id", "")
+        task = raw_sample.get("confirmed_task", "")
+        website = raw_sample.get("website", "")
+        domain = raw_sample.get("domain", "")
+        subdomain = raw_sample.get("subdomain", "")
 
-        # Task
-        task = row.get("confirmed_task", "") or row.get("task", "") or ""
+        # Get HTML — use cleaned_html for DOM serialization
+        cleaned_html = raw_sample.get("cleaned_html", "")
+        raw_html = raw_sample.get("raw_html", "")
 
-        # Build candidate pool
-        pos_raw = row.get("pos_candidates", []) or []
-        neg_raw = row.get("neg_candidates", []) or []
-        if isinstance(pos_raw, str):
-            pos_raw = json.loads(pos_raw) if pos_raw else []
-        if isinstance(neg_raw, str):
-            neg_raw = json.loads(neg_raw) if neg_raw else []
+        # Serialize full DOM (NOT candidate pool)
+        serialized_dom = ""
+        if cleaned_html:
+            try:
+                serialized_dom, _ = self.serializer.serialize_from_html(cleaned_html)
+            except Exception as e:
+                logger.warning(f"DOM serialization failed for {sample_id}: {e}")
+                serialized_dom = ""
 
-        pool, target_idx = build_candidate_pool(
-            pos_raw, neg_raw,
-            max_candidates=self.max_candidates,
-            shuffle=(self.split == "train"),
+        # Extract screenshot
+        screenshot = None
+        if include_screenshot:
+            screenshot = self._extract_screenshot(raw_sample)
+
+        # Build ground-truth action
+        action = self._build_action(raw_sample)
+        action_repr = self._get_action_repr(raw_sample)
+
+        return Mind2WebSample(
+            sample_id=sample_id,
+            task=task,
+            website=website,
+            domain=domain,
+            subdomain=subdomain,
+            raw_html=raw_html,
+            cleaned_html=cleaned_html,
+            serialized_dom=serialized_dom,
+            screenshot=screenshot,
+            action=action,
+            action_repr=action_repr,
+            trajectory_id=sample_id,
         )
 
-        # Element signatures
-        element_sigs = [c.get("signature", "") for c in pool]
+    def build_training_examples(
+        self,
+        split: str = "train",
+        max_samples: Optional[int] = None,
+        include_screenshot: bool = True,
+    ) -> List[Mind2WebSample]:
+        """
+        Build all training examples from the dataset.
 
-        # DOM elements for structural features
-        dom_elements = candidates_to_dom_elements(pool)
+        This loads the FULL dataset (no sample limit by default).
+        """
+        ds = self.load_dataset(split=split, max_samples=max_samples)
+        samples = []
 
-        return {
-            "sample_id": str(row.get("action_uid", "")),
-            "task": task,
-            "element_signatures": element_sigs,
-            "num_elements": len(pool),
-            "target_element_idx": target_idx,
-            "operation_label": op_label,
-            "value": value,
-            "domain": row.get("domain", "") or "",
-            "website": row.get("website", "") or "",
-            "dom_elements": dom_elements,
-            "trajectory_length": int(row.get("num_steps", 1) or 1),
+        for i, raw in enumerate(ds):
+            try:
+                sample = self.process_sample(raw, include_screenshot=include_screenshot)
+                if sample.serialized_dom and sample.action:
+                    samples.append(sample)
+            except Exception as e:
+                logger.warning(f"Failed to process sample {i}: {e}")
+                continue
+
+            if (i + 1) % 1000 == 0:
+                logger.info(f"Processed {i + 1} samples, {len(samples)} valid")
+
+        logger.info(f"Built {len(samples)} training examples from {split}")
+        return samples
+
+    def build_trajectories(
+        self,
+        split: str = "train",
+        max_samples: Optional[int] = None,
+        include_screenshot: bool = True,
+    ) -> List[Mind2WebTrajectory]:
+        """
+        Group samples into trajectories for multi-step training.
+
+        Samples with the same annotation_id prefix are grouped together.
+        Each step gets the action history from previous steps.
+        """
+        samples = self.build_training_examples(
+            split=split,
+            max_samples=max_samples,
+            include_screenshot=include_screenshot,
+        )
+
+        # Group by trajectory_id (annotation_id)
+        traj_map: Dict[str, List[Mind2WebSample]] = {}
+        for s in samples:
+            tid = s.trajectory_id
+            if tid not in traj_map:
+                traj_map[tid] = []
+            traj_map[tid].append(s)
+
+        trajectories = []
+        for tid, steps in traj_map.items():
+            # Sort by step index
+            steps.sort(key=lambda s: s.step_index)
+
+            # Build action history for each step
+            history: List[Dict[str, Any]] = []
+            for i, step in enumerate(steps):
+                step.step_index = i
+                step.action_history = list(history)
+                history.append({
+                    "step": i,
+                    "action": step.action.get("action", ""),
+                    "element_id": step.action.get("element_id", -1),
+                    "value": step.action.get("value", ""),
+                    "description": step.action_repr,
+                })
+
+            trajectories.append(Mind2WebTrajectory(
+                trajectory_id=tid,
+                task=steps[0].task if steps else "",
+                website=steps[0].website if steps else "",
+                domain=steps[0].domain if steps else "",
+                steps=steps,
+            ))
+
+        logger.info(f"Built {len(trajectories)} trajectories with {sum(len(t.steps) for t in trajectories)} total steps")
+        return trajectories
+
+    def _build_action(self, raw_sample: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build ground-truth action JSON from Mind2Web sample.
+
+        Uses operation field + pos_candidates to determine:
+          - action type (CLICK/TYPE/SELECT)
+          - target element (mapped to DOM node ID)
+          - value (for TYPE/SELECT)
+        """
+        operation = raw_sample.get("operation", {})
+        if isinstance(operation, str):
+            try:
+                operation = json.loads(operation)
+            except json.JSONDecodeError:
+                return {}
+
+        op_type = operation.get("op", "CLICK").upper()
+        action_type = _OP_MAP.get(op_type, "CLICK")
+        value = operation.get("value", "")
+
+        # Get target element from pos_candidates
+        pos_candidates = raw_sample.get("pos_candidates", [])
+        if isinstance(pos_candidates, str):
+            try:
+                pos_candidates = json.loads(pos_candidates)
+            except json.JSONDecodeError:
+                pos_candidates = []
+
+        # Build the target element info
+        target_element_id = -1
+        if pos_candidates:
+            # Use the first positive candidate
+            first_pos = pos_candidates[0] if isinstance(pos_candidates, list) else pos_candidates
+            if isinstance(first_pos, dict):
+                target_element_id = first_pos.get("backend_node_id", -1)
+            elif isinstance(first_pos, (int, float)):
+                target_element_id = int(first_pos)
+
+        action: Dict[str, Any] = {"action": action_type}
+
+        if action_type in ("CLICK", "TYPE", "SELECT"):
+            action["element_id"] = target_element_id
+
+        if action_type == "TYPE" and value:
+            action["value"] = str(value)
+        elif action_type == "SELECT" and value:
+            action["value"] = str(value)
+
+        return action
+
+    def _get_action_repr(self, raw_sample: Dict[str, Any]) -> str:
+        """Get human-readable action representation."""
+        action_reprs = raw_sample.get("action_reprs", [])
+        target_idx = raw_sample.get("target_action_index", 0)
+        target_reprs = raw_sample.get("target_action_reprs", "")
+
+        if target_reprs:
+            return str(target_reprs)
+        if action_reprs:
+            if isinstance(action_reprs, list) and len(action_reprs) > 0:
+                idx = min(target_idx, len(action_reprs) - 1)
+                return str(action_reprs[idx])
+            return str(action_reprs)
+        return ""
+
+    def _extract_screenshot(self, raw_sample: Dict[str, Any]) -> Optional[Image.Image]:
+        """Extract screenshot from the dataset sample."""
+        screenshot = raw_sample.get("screenshot")
+        if screenshot is None:
+            return None
+
+        # If it's already a PIL Image
+        if isinstance(screenshot, Image.Image):
+            return screenshot
+
+        # If it's bytes
+        if isinstance(screenshot, bytes):
+            from io import BytesIO
+            try:
+                return Image.open(BytesIO(screenshot))
+            except Exception:
+                return None
+
+        # If it's a path string
+        if isinstance(screenshot, str):
+            try:
+                return Image.open(screenshot)
+            except Exception:
+                return None
+
+        return None
+
+
+class Mind2WebCollator:
+    """
+    Collate Mind2WebSamples into batches for training.
+
+    Handles tokenization, padding, and label construction
+    for the VLA model's causal LM training.
+    """
+
+    def __init__(
+        self,
+        processor,
+        prompt_builder,
+        max_seq_length: int = 4096,
+    ):
+        self.processor = processor
+        self.prompt_builder = prompt_builder
+        self.max_seq_length = max_seq_length
+
+    def __call__(
+        self,
+        samples: List[Mind2WebSample],
+    ) -> Dict[str, Any]:
+        """
+        Collate samples into a training batch.
+
+        Returns dict with input_ids, attention_mask, labels, and
+        optionally pixel_values for screenshots.
+        """
+        import torch
+
+        batch_input_ids = []
+        batch_labels = []
+        batch_attention_mask = []
+        batch_images = []
+
+        for sample in samples:
+            # Build training prompt
+            training = self.prompt_builder.build_training_prompt(
+                task=sample.task,
+                serialized_dom=sample.serialized_dom,
+                target_action=sample.action,
+                action_history=sample.action_history,
+                extra_context=f"URL: {sample.website}" if sample.website else "",
+            )
+
+            prompt_text = training["prompt"]
+            target_text = training["target"]
+            full_text = training["full_text"]
+
+            # Tokenize
+            prompt_tokens = self.processor.tokenizer(
+                prompt_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_seq_length - 100,  # leave room for target
+                add_special_tokens=False,
+            )
+            target_tokens = self.processor.tokenizer(
+                "\n" + target_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+
+            # Build input_ids and labels
+            input_ids = torch.cat([
+                prompt_tokens["input_ids"][0],
+                target_tokens["input_ids"][0],
+            ])
+
+            # Labels: -100 for prompt tokens, actual tokens for target
+            labels = torch.cat([
+                torch.full_like(prompt_tokens["input_ids"][0], -100),
+                target_tokens["input_ids"][0],
+            ])
+
+            # Truncate to max length
+            input_ids = input_ids[:self.max_seq_length]
+            labels = labels[:self.max_seq_length]
+
+            batch_input_ids.append(input_ids)
+            batch_labels.append(labels)
+            batch_attention_mask.append(torch.ones_like(input_ids))
+
+            if sample.screenshot is not None:
+                batch_images.append(sample.screenshot)
+
+        # Pad to same length
+        max_len = max(ids.shape[0] for ids in batch_input_ids)
+        pad_token_id = self.processor.tokenizer.pad_token_id or 0
+
+        padded_input_ids = []
+        padded_labels = []
+        padded_attention_mask = []
+
+        for ids, lbls, mask in zip(batch_input_ids, batch_labels, batch_attention_mask):
+            pad_len = max_len - ids.shape[0]
+            padded_input_ids.append(
+                torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
+            )
+            padded_labels.append(
+                torch.cat([lbls, torch.full((pad_len,), -100, dtype=lbls.dtype)])
+            )
+            padded_attention_mask.append(
+                torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
+            )
+
+        result = {
+            "input_ids": torch.stack(padded_input_ids),
+            "attention_mask": torch.stack(padded_attention_mask),
+            "labels": torch.stack(padded_labels),
         }
 
-
-# ── Collate ──────────────────────────────────────────────────
-
-def vla_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Custom collate for variable-length candidate pools."""
-    target_idx = torch.tensor(
-        [s["target_element_idx"] for s in batch], dtype=torch.long,
-    )
-    op_labels = torch.tensor(
-        [s["operation_label"] for s in batch], dtype=torch.long,
-    )
-    return {
-        "target_element_idx": target_idx,
-        "operation_label": op_labels,
-        "tasks": [s["task"] for s in batch],
-        "element_signatures": [s["element_signatures"] for s in batch],
-        "num_elements": [s["num_elements"] for s in batch],
-        "sample_ids": [s["sample_id"] for s in batch],
-        "dom_elements": [s["dom_elements"] for s in batch],
-        "domains": [s.get("domain", "") for s in batch],
-        "trajectory_lengths": [s["trajectory_length"] for s in batch],
-    }
-
-
-def build_dataloader(
-    split: str = "train",
-    config: Optional[DataConfig] = None,
-    max_samples: Optional[int] = None,
-    shuffle: bool = True,
-    num_workers: int = 0,
-    batch_size: int = 8,
-) -> DataLoader:
-    """Convenience builder for a DataLoader."""
-    cfg = config or DataConfig()
-    ds = Mind2WebDataset(split=split, config=cfg, max_samples=max_samples)
-    return DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle,
-        num_workers=num_workers, collate_fn=vla_collate_fn, pin_memory=False,
-    )
+        return result

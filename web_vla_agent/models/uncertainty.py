@@ -1,175 +1,195 @@
 """
-Entropy-Based Uncertainty Estimation (Refactored).
+Token-Level Uncertainty Estimation for VLA Web Agent.
 
-Stripped to predictive entropy only. No learned confidence head,
-no MC-Dropout, no calibration loss.
+NOT entropy of classification logits.
 
-**Mathematical formulation**:
-    Candidate distribution:  p_i = softmax(score_i / τ)
-    Predictive entropy:      H(p) = -Σ p_i log p_i
-    Replanning trigger:      replan if H(p) > τ_thresh
+Instead computes:
+  1. Average token log probability of generated JSON
+  2. Beam disagreement (compare top-K beam outputs)
+  3. Ensemble variance (optional)
 
-Entropy threshold τ is auto-computed from validation set
-(90th percentile) at the end of Phase 2.
+If confidence < threshold → trigger regeneration or alternative beam.
+
+Threshold calibrated on validation set.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import torch
-import torch.nn.functional as F
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
 class UncertaintyResult:
-    """Bundle of uncertainty diagnostics for a single step."""
-    predictive_entropy: float = 0.0
-    max_probability: float = 0.0
-    margin: float = 0.0            # gap between top-1 and top-2
-    should_replan: bool = False
+    """Result of uncertainty estimation."""
+    avg_log_prob: float = 0.0
+    should_regenerate: bool = False
+    beam_agreement: float = 1.0       # 1.0 = all beams agree
+    selected_action: Optional[Dict[str, Any]] = None
+    reason: str = ""
 
 
-class EntropyUncertainty:
+class TokenUncertainty:
     """
-    Entropy-based uncertainty estimation for grounding decisions.
+    Token-level uncertainty for generative VLA model.
 
-    Purely functional — no learnable parameters. Uses predictive entropy
-    over softmax candidate distribution to trigger replanning.
+    Uses average log probability of generated tokens and beam
+    disagreement to decide if the model is confident.
 
     Parameters
     ----------
-    threshold_tau : float
-        Entropy threshold for replanning trigger.
-        Auto-calibrated from validation set at end of Phase 2.
-    temperature : float
-        Temperature for softmax over grounding scores.
+    min_log_prob : float
+        Minimum average log probability threshold. Below this → regenerate.
+    beam_width : int
+        Number of beams for disagreement check.
+    max_regenerations : int
+        Maximum number of regeneration attempts.
     """
 
     def __init__(
         self,
-        threshold_tau: float = 1.5,
-        temperature: float = 0.07,
+        min_log_prob: float = -2.0,
+        beam_width: int = 3,
+        max_regenerations: int = 2,
     ):
-        self.threshold_tau = threshold_tau
-        self.temperature = temperature
+        self.min_log_prob = min_log_prob
+        self.beam_width = beam_width
+        self.max_regenerations = max_regenerations
+        self._calibrated = False
 
-    # ── Entropy computation ──────────────────────────────────
-
-    @staticmethod
-    def predictive_entropy(probs: torch.Tensor) -> torch.Tensor:
+    def assess(
+        self,
+        generation_result: Dict[str, Any],
+    ) -> UncertaintyResult:
         """
-        Compute predictive entropy: H(p) = -Σ p_i log p_i.
+        Assess uncertainty from a single generation.
 
         Parameters
         ----------
-        probs : [B, N] — probability distribution over candidates
+        generation_result : dict
+            Must contain "avg_log_prob" and "text".
 
         Returns
         -------
-        [B] — entropy per sample
+        UncertaintyResult
         """
-        log_probs = torch.log(probs.clamp(min=1e-8))
-        return -(probs * log_probs).sum(dim=-1)
+        avg_lp = generation_result.get("avg_log_prob", 0.0)
+        text = generation_result.get("text", "")
 
-    def compute_uncertainty(
+        should_regenerate = avg_lp < self.min_log_prob
+
+        reason = ""
+        if should_regenerate:
+            reason = f"avg_log_prob={avg_lp:.3f} < threshold={self.min_log_prob}"
+
+        return UncertaintyResult(
+            avg_log_prob=avg_lp,
+            should_regenerate=should_regenerate,
+            reason=reason,
+        )
+
+    def assess_beams(
         self,
-        scores: torch.Tensor,  # [B, N] — raw grounding scores
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        beam_results: List[Dict[str, Any]],
+    ) -> UncertaintyResult:
         """
-        Compute uncertainty metrics from grounding scores.
+        Assess uncertainty from beam search results.
 
-        Returns
-        -------
-        entropy    : [B] — predictive entropy
-        max_prob   : [B] — maximum probability (confidence)
-        margin     : [B] — gap between top-1 and top-2 probability
+        Checks:
+          1. Agreement: do all beams produce the same action type + element_id?
+          2. Score spread: how different are the beam scores?
+
+        Parameters
+        ----------
+        beam_results : list of dicts
+            Each with "text" and "score".
         """
-        probs = F.softmax(scores / self.temperature, dim=-1)  # [B, N]
-        entropy = self.predictive_entropy(probs)
+        if not beam_results:
+            return UncertaintyResult(
+                should_regenerate=True,
+                reason="No beam results",
+            )
 
-        sorted_probs, _ = probs.sort(dim=-1, descending=True)
-        max_prob = sorted_probs[:, 0]
-        margin = sorted_probs[:, 0] - sorted_probs[:, 1] if probs.shape[-1] > 1 else max_prob
+        # Parse actions from all beams
+        parsed_actions = []
+        for beam in beam_results:
+            try:
+                action = json.loads(beam["text"])
+                parsed_actions.append(action)
+            except (json.JSONDecodeError, ValueError):
+                parsed_actions.append(None)
 
-        return entropy, max_prob, margin
+        # Check agreement on action type and element_id
+        valid_actions = [a for a in parsed_actions if a is not None]
+        if not valid_actions:
+            return UncertaintyResult(
+                should_regenerate=True,
+                beam_agreement=0.0,
+                reason="No valid actions from any beam",
+            )
 
-    def should_replan(
+        # Agreement metric: what fraction agree on action + element_id?
+        signatures = []
+        for a in valid_actions:
+            sig = f"{a.get('action', '?')}_{a.get('element_id', '?')}"
+            signatures.append(sig)
+
+        most_common = max(set(signatures), key=signatures.count)
+        agreement = signatures.count(most_common) / len(signatures)
+
+        # Best action (from highest-scoring beam with most common signature)
+        best_action = None
+        best_score = float("-inf")
+        for i, (beam, action) in enumerate(zip(beam_results, parsed_actions)):
+            if action is None:
+                continue
+            sig = f"{action.get('action', '?')}_{action.get('element_id', '?')}"
+            if sig == most_common and beam.get("score", 0) > best_score:
+                best_action = action
+                best_score = beam["score"]
+
+        should_regenerate = agreement < 0.5
+
+        return UncertaintyResult(
+            avg_log_prob=best_score,
+            should_regenerate=should_regenerate,
+            beam_agreement=agreement,
+            selected_action=best_action,
+            reason=f"beam_agreement={agreement:.2f}" if should_regenerate else "",
+        )
+
+    def calibrate(
         self,
-        scores: torch.Tensor,  # [B, N]
-    ) -> torch.Tensor:
-        """
-        Determine if replanning is needed based on entropy threshold.
-
-        Returns
-        -------
-        [B] — boolean tensor, True = should replan
-        """
-        entropy, _, _ = self.compute_uncertainty(scores)
-        return entropy > self.threshold_tau
-
-    def calibrate_threshold(
-        self,
-        all_entropies: torch.Tensor,  # [M] — entropy values from validation
-        percentile: float = 90.0,
+        log_probs: List[float],
+        percentile: float = 10.0,
     ) -> float:
         """
-        Auto-compute entropy threshold from validation percentile.
+        Calibrate threshold from validation set log probabilities.
 
-        Sets τ to the given percentile of validation entropy distribution.
-        Target: replan_fraction between 5-15%.
-
-        Parameters
-        ----------
-        all_entropies : [M] — entropy values from validation set
-        percentile : float — percentile to use (default 90th)
-
-        Returns
-        -------
-        float — calibrated threshold
+        Sets threshold at the given percentile of validation log probs.
         """
-        tau = torch.quantile(all_entropies.float(), percentile / 100.0).item()
-        self.threshold_tau = tau
-        return tau
+        if not log_probs:
+            return self.min_log_prob
 
-    def entropy_statistics(
+        sorted_lps = sorted(log_probs)
+        idx = max(0, int(len(sorted_lps) * percentile / 100.0))
+        self.min_log_prob = sorted_lps[idx]
+        self._calibrated = True
+        return self.min_log_prob
+
+    def statistics(
         self,
-        scores: torch.Tensor,  # [B, N]
+        log_probs: List[float],
     ) -> Dict[str, float]:
-        """
-        Compute full entropy distribution statistics for logging.
+        """Compute statistics over a batch of log probabilities."""
+        if not log_probs:
+            return {"mean": 0, "min": 0, "max": 0, "regenerate_fraction": 0}
 
-        Returns mean, std, and percentiles of entropy distribution.
-        """
-        entropy, _, _ = self.compute_uncertainty(scores)
         return {
-            "entropy_mean": entropy.mean().item(),
-            "entropy_std": entropy.std().item(),
-            "entropy_min": entropy.min().item(),
-            "entropy_max": entropy.max().item(),
-            "entropy_p50": torch.quantile(entropy.float(), 0.5).item(),
-            "entropy_p90": torch.quantile(entropy.float(), 0.9).item(),
-            "entropy_p95": torch.quantile(entropy.float(), 0.95).item(),
-            "replan_fraction": (entropy > self.threshold_tau).float().mean().item(),
+            "mean": sum(log_probs) / len(log_probs),
+            "min": min(log_probs),
+            "max": max(log_probs),
+            "regenerate_fraction": sum(
+                1 for lp in log_probs if lp < self.min_log_prob
+            ) / len(log_probs),
         }
-
-    # ── High-level API ───────────────────────────────────────
-
-    def analyse(
-        self,
-        scores: torch.Tensor,  # [B, N]
-    ) -> List[UncertaintyResult]:
-        """Produce per-sample UncertaintyResult for logging/decision making."""
-        entropy, max_prob, margin = self.compute_uncertainty(scores)
-        replan = self.should_replan(scores)
-        B = scores.shape[0]
-
-        results = []
-        for i in range(B):
-            results.append(UncertaintyResult(
-                predictive_entropy=entropy[i].item(),
-                max_probability=max_prob[i].item(),
-                margin=margin[i].item(),
-                should_replan=replan[i].item(),
-            ))
-        return results

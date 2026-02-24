@@ -4,8 +4,8 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "web-vla-agent"
-version = "0.1.0"
-description = "Publication-grade Vision-Language-Action Web Agent"
+version = "2.0.0"
+description = "End-to-End Multimodal Sequential VLA Web Agent"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 
@@ -17,13 +17,13 @@ dependencies = [
     "peft>=0.7",
     "accelerate>=0.25",
 
-    # Graph
-    "torch-geometric>=2.4",
+    # Quantization
+    "bitsandbytes>=0.41",
 
     # Multimodal
     "Pillow>=10.0",
     "numpy>=1.24",
-    "sentence-transformers>=2.2",
+    "qwen-vl-utils",
 
     # Browser
     "playwright>=1.40",
@@ -48,7 +48,7 @@ rl = ["gymnasium>=0.29", "stable-baselines3>=2.1"]
 [project.scripts]
 vla-train = "training.train_supervised:main"
 vla-eval = "evaluation.evaluate:main"
-vla-agent = "main:main"
+vla-agent = "inference.run_agent:main"
 
 [tool.ruff]
 line-length = 100

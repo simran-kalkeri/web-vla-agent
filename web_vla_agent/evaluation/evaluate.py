@@ -1,398 +1,357 @@
 """
-Evaluation Suite — Publication-Grade with Ablation Framework (Refactored).
+Evaluation Module for VLA Web Agent.
 
-Ablation presets:
-  full                — all components active (proposed system)
-  no_graph            — remove GCN → use flat DOM embeddings
-  no_cross_attention  — replace cross-attn with linear fusion
-  no_entropy          — disable replan trigger
-  dom_only            — remove visual embeddings
-  action_unweighted   — remove class weighting / focal loss (γ=0)
+Implements all required metrics:
+  - Element grounding accuracy
+  - Action accuracy (full JSON match)
+  - Task completion rate
+  - Mean steps to completion
+  - Failure mode breakdown
+  - Per-action F1
+  - Inference latency measurement
 """
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-import torch.nn.functional as F
-
-from data.mind2web_loader import Mind2WebDataset, vla_collate_fn
-from models.encoders import TextEncoder, VisionEncoder
-from models.graph_dom_encoder import GraphDOMEncoder, structural_features, build_edge_index
-from models.grounder import VLAGrounderBatched
-from models.uncertainty import EntropyUncertainty
-from evaluation.metrics import MetricsTracker, TaskResult, StepResult
-from utils.config import VLAConfig, load_config
-from utils.logging import get_logger, log_metrics
+logger = logging.getLogger(__name__)
 
 
-ACTION_NAMES = ["CLICK", "TYPE", "SCROLL", "SELECT"]
+@dataclass
+class StepResult:
+    """Result of a single step evaluation."""
+    predicted_action: Dict[str, Any] = field(default_factory=dict)
+    ground_truth_action: Dict[str, Any] = field(default_factory=dict)
+    action_correct: bool = False
+    element_correct: bool = False
+    value_correct: bool = False
+    full_match: bool = False
+    latency_ms: float = 0.0
+    log_prob: float = 0.0
+    parse_success: bool = True
 
 
-# ── Ablation Presets ─────────────────────────────────────────
-
-class AblationMode:
-    """Flags to selectively disable components for ablation study."""
-
-    def __init__(
-        self,
-        no_graph: bool = False,             # Remove GCN → flat DOM
-        no_cross_attention: bool = False,    # Replace cross-attn with linear
-        no_entropy: bool = False,            # Disable replan trigger
-        dom_only: bool = False,              # Remove visual embeddings
-        action_unweighted: bool = False,     # Remove focal loss (γ=0)
-        name: str = "full",
-    ):
-        self.no_graph = no_graph
-        self.no_cross_attention = no_cross_attention
-        self.no_entropy = no_entropy
-        self.dom_only = dom_only
-        self.action_unweighted = action_unweighted
-        self.name = name
-
-    def __repr__(self):
-        active = [k for k, v in self.__dict__.items() if v is True and k != "name"]
-        return f"AblationMode({self.name}, disabled={active})"
+@dataclass
+class TaskResult:
+    """Result of a full task evaluation."""
+    task_id: str = ""
+    task: str = ""
+    steps: List[StepResult] = field(default_factory=list)
+    completed: bool = False
+    num_steps: int = 0
+    total_latency_ms: float = 0.0
+    failure_reason: str = ""
 
 
-ABLATION_PRESETS = {
-    "full": AblationMode(name="full"),
-    "no_graph": AblationMode(no_graph=True, name="no_graph"),
-    "no_cross_attention": AblationMode(no_cross_attention=True, name="no_cross_attention"),
-    "no_entropy": AblationMode(no_entropy=True, name="no_entropy"),
-    "dom_only": AblationMode(dom_only=True, name="dom_only"),
-    "action_unweighted": AblationMode(action_unweighted=True, name="action_unweighted"),
-}
-
-
-# ── Evaluator ────────────────────────────────────────────────
-
-class Evaluator:
+class VLAEvaluator:
     """
-    Evaluate trained VLA agent on Mind2Web test splits with ablation.
+    Evaluate VLA Web Agent on Mind2Web test sets.
 
-    Parameters
-    ----------
-    config : VLAConfig
-    checkpoint_path : str | None
-    device : str
-    ablation : AblationMode | None
+    Computes all required metrics and produces detailed reports.
     """
 
-    def __init__(
+    def __init__(self, action_types: Optional[List[str]] = None):
+        self.action_types = action_types or ["CLICK", "TYPE", "SELECT", "SCROLL"]
+        self.results: List[TaskResult] = []
+        self.step_results: List[StepResult] = []
+
+    def evaluate_step(
         self,
-        config: Optional[VLAConfig] = None,
-        checkpoint_path: Optional[str] = None,
-        device: str = "cpu",
-        ablation: Optional[AblationMode] = None,
-    ):
-        self.config = config or load_config()
-        self.device = device
-        self.ablation = ablation or AblationMode()
-        self.logger = get_logger("evaluator")
-        self.logger.info(f"Ablation mode: {self.ablation}")
+        predicted: Dict[str, Any],
+        ground_truth: Dict[str, Any],
+        latency_ms: float = 0.0,
+        log_prob: float = 0.0,
+    ) -> StepResult:
+        """
+        Evaluate a single predicted action against ground truth.
+        """
+        pred_action = predicted.get("action", "").upper()
+        gt_action = ground_truth.get("action", "").upper()
 
-        # ── Frozen encoders ──────────────────────────────────
-        self.text_encoder = TextEncoder(
-            model_name=self.config.model.text_encoder,
-            output_dim=self.config.model.text_dim,
-            device=device,
+        action_correct = pred_action == gt_action
+
+        pred_eid = predicted.get("element_id")
+        gt_eid = ground_truth.get("element_id")
+        element_correct = pred_eid == gt_eid
+
+        pred_value = str(predicted.get("value", "")).strip().lower()
+        gt_value = str(ground_truth.get("value", "")).strip().lower()
+        value_correct = pred_value == gt_value if gt_value else True
+
+        full_match = action_correct and element_correct and value_correct
+
+        result = StepResult(
+            predicted_action=predicted,
+            ground_truth_action=ground_truth,
+            action_correct=action_correct,
+            element_correct=element_correct,
+            value_correct=value_correct,
+            full_match=full_match,
+            latency_ms=latency_ms,
+            log_prob=log_prob,
         )
-        self.vision_encoder = VisionEncoder(
-            model_name=self.config.model.vision_encoder,
-            output_dim=self.config.model.vision_dim,
-            device=device,
-        )
+        self.step_results.append(result)
+        return result
 
-        # ── Graph encoder (disabled in no_graph ablation) ────
-        self.graph_encoder = None
-        if not self.ablation.no_graph:
-            self.graph_encoder = GraphDOMEncoder(
-                text_dim=self.config.model.text_dim,
-                struct_dim=self.config.graph.structural_dim,
-                hidden_dim=self.config.model.hidden_dim,
-                dropout=0.0,
-            ).to(device)
-
-        # ── Grounder ─────────────────────────────────────────
-        grounder_text_dim = (
-            self.config.model.hidden_dim if not self.ablation.no_graph
-            else self.config.model.text_dim
-        )
-        self.grounder = VLAGrounderBatched(
-            d_model=self.config.model.hidden_dim,
-            text_dim=grounder_text_dim,
-            vision_dim=self.config.model.vision_dim,
-            subgoal_dim=self.config.model.text_dim,
-            num_heads=self.config.grounder.num_heads,
-            temperature=self.config.grounder.contrastive_temperature,
-            dropout=0.0,
-            num_action_types=self.config.model.num_action_types,
-        ).to(device)
-
-        # ── Uncertainty (disabled in no_entropy ablation) ────
-        self.uncertainty = None
-        if not self.ablation.no_entropy:
-            self.uncertainty = EntropyUncertainty(
-                threshold_tau=self.config.uncertainty.entropy_threshold,
-                temperature=self.config.uncertainty.temperature,
-            )
-
-        # ── Load checkpoint ──────────────────────────────────
-        if checkpoint_path:
-            self._load_checkpoint(checkpoint_path)
-
-        # Set eval mode
-        if self.graph_encoder:
-            self.graph_encoder.eval()
-        self.grounder.eval()
-
-    # ── Main evaluation ──────────────────────────────────────
-
-    def evaluate(
+    def evaluate_batch(
         self,
-        splits: Optional[List[str]] = None,
+        model,
+        samples: list,
+        prompt_builder,
+        action_decoder,
         max_samples: Optional[int] = None,
-        output_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        splits = splits or self.config.evaluation.splits
-        all_results: Dict[str, Any] = {}
+        """
+        Evaluate model on a batch of samples.
 
-        for split in splits:
-            self.logger.info(f"Evaluating on {split} [ablation={self.ablation.name}]...")
-            tracker = MetricsTracker(
-                long_horizon_threshold=self.config.evaluation.long_horizon_threshold
-            )
+        Parameters
+        ----------
+        model : VLAModel
+        samples : list of Mind2WebSample
+        prompt_builder : PromptBuilder
+        action_decoder : ActionDecoder
+        max_samples : int, optional
+        """
+        eval_samples = samples[:max_samples] if max_samples else samples
 
-            dataset = Mind2WebDataset(
-                split=split, config=self.config.data, max_samples=max_samples,
-            )
-            loader = torch.utils.data.DataLoader(
-                dataset, batch_size=1, shuffle=False,
-                collate_fn=vla_collate_fn, num_workers=0,
-            )
-
-            with torch.no_grad():
-                for batch in loader:
-                    task_result = self._evaluate_sample(batch)
-                    tracker.add_task(task_result)
-
-            metrics = tracker.compute()
-            metrics["num_samples"] = tracker.num_tasks
-            metrics["ablation"] = self.ablation.name
-            all_results[split] = metrics
-
-            self.logger.info(f"\n{tracker.summary()}")
-
-        if output_path:
-            Path(output_path).write_text(
-                json.dumps(all_results, indent=2, default=str)
-            )
-            self.logger.info(f"Results saved to {output_path}")
-
-        return all_results
-
-    # ── Per-sample evaluation ────────────────────────────────
-
-    def _evaluate_sample(self, batch: Dict[str, Any]) -> TaskResult:
-        H = self.config.model.hidden_dim
-
-        # Encode subgoal
-        subgoal_embs = self.text_encoder(batch["tasks"])
-
-        # Encode DOM elements
-        sigs = batch["element_signatures"][0]
-        dom_elements = batch["dom_elements"][0]
-
-        if sigs and dom_elements:
-            et = self.text_encoder(sigs)
-
-            # Graph encoding (or passthrough for no_graph ablation)
-            if self.graph_encoder and not self.ablation.no_graph:
-                struct_feat = structural_features(dom_elements).to(self.device)
-                edge_index, _ = build_edge_index(dom_elements)
-                edge_index = edge_index.to(self.device)
-                dom_emb = self.graph_encoder(et, struct_feat, edge_index)
-            else:
-                dom_emb = et  # Flat: [N, text_dim]
-        else:
-            text_dim = self.config.model.text_dim if self.ablation.no_graph else H
-            dom_emb = torch.zeros(0, text_dim, device=self.device)
-
-        # Vision (zero for dom_only ablation)
-        if self.ablation.dom_only:
-            ev = torch.zeros(dom_emb.shape[0], self.config.model.vision_dim, device=self.device)
-        else:
-            ev = torch.randn(dom_emb.shape[0], self.config.model.vision_dim, device=self.device) * 0.01
-
-        # Forward through grounder
-        all_elem_logits, action_logits, all_scores, all_reprs = self.grounder(
-            subgoal_embs, [dom_emb], [ev]
-        )
-
-        elem_logits_0 = all_elem_logits[0]
-        scores_0 = all_scores[0]
-        n = elem_logits_0.shape[0]
-
-        # Top-K for recall
-        top_indices = []
-        if n > 0:
-            K = min(10, n)
-            _, tidx = torch.topk(elem_logits_0, K)
-            top_indices = tidx.tolist()
-
-        # Entropy diagnostics
-        predictive_entropy = 0.0
-        replan_triggered = False
-        if self.uncertainty and n > 0:
-            padded_scores = scores_0.unsqueeze(0)  # [1, N]
-            entropy, _, _ = self.uncertainty.compute_uncertainty(padded_scores)
-            predictive_entropy = entropy[0].item()
-            replan_triggered = self.uncertainty.should_replan(padded_scores)[0].item()
-
-        # Predictions
-        pred_action_idx = action_logits.argmax(-1).item()
-        pred_element_idx = elem_logits_0.argmax().item() if n > 0 else -1
-
-        # Ground truth
-        true_action_idx = batch["operation_label"][0].item()
-        true_element_global = batch["target_element_idx"][0].item()
-
-        true_in_topk = true_element_global in top_indices
-        true_rank = top_indices.index(true_element_global) if true_in_topk else -1
-
-        step = StepResult(
-            predicted_action=ACTION_NAMES[pred_action_idx] if pred_action_idx < len(ACTION_NAMES) else "?",
-            true_action=ACTION_NAMES[true_action_idx] if true_action_idx < len(ACTION_NAMES) else "?",
-            predicted_element=str(pred_element_idx),
-            true_element=str(true_element_global),
-            action_correct=(pred_action_idx == true_action_idx),
-            element_correct=(pred_element_idx == true_element_global and n > 0),
-            step_correct=(
-                pred_action_idx == true_action_idx
-                and pred_element_idx == true_element_global
-                and n > 0
-            ),
-            num_candidates=n,
-            true_element_in_top_k=true_in_topk,
-            true_element_rank=true_rank,
-            predictive_entropy=predictive_entropy,
-        )
-
-        return TaskResult(
-            task_id=batch["sample_ids"][0],
-            task_description=batch["tasks"][0],
-            success=step.step_correct,
-            num_steps=batch["trajectory_lengths"][0],
-            step_results=[step],
-            mean_entropy=predictive_entropy,
-            replan_triggered=replan_triggered,
-        )
-
-    # ── Checkpoint loading ───────────────────────────────────
-
-    def _load_checkpoint(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        if "graph_encoder" in ckpt and self.graph_encoder:
-            self.graph_encoder.load_state_dict(ckpt["graph_encoder"])
-        self.grounder.load_state_dict(ckpt["grounder"])
-        # Load calibrated entropy threshold if available
-        ts = ckpt.get("training_state", {})
-        if self.uncertainty and "entropy_threshold" in ts:
-            self.uncertainty.threshold_tau = ts["entropy_threshold"]
-        self.logger.info(f"Loaded checkpoint: {path}")
-
-
-# ── Ablation Runner ──────────────────────────────────────────
-
-def run_all_ablations(
-    config: VLAConfig,
-    checkpoint_path: Optional[str] = None,
-    device: str = "cpu",
-    max_samples: Optional[int] = None,
-    output_dir: str = "ablation_results",
-) -> Dict[str, Dict]:
-    """Run evaluation across all ablation presets."""
-    logger = get_logger("ablation_runner")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    all_ablation_results = {}
-
-    for name, ablation in ABLATION_PRESETS.items():
-        logger.info(f"\n{'='*60}\nRunning ablation: {name}\n{'='*60}")
-        evaluator = Evaluator(
-            config=config,
-            checkpoint_path=checkpoint_path,
-            device=device,
-            ablation=ablation,
-        )
-        results = evaluator.evaluate(
-            max_samples=max_samples,
-            output_path=str(Path(output_dir) / f"{name}.json"),
-        )
-        all_ablation_results[name] = results
-
-    # Summary table
-    logger.info("\n" + "=" * 80)
-    logger.info("  ABLATION STUDY SUMMARY")
-    logger.info("=" * 80)
-    header = f"  {'Ablation':<25} {'Elem Acc':>10} {'Act Acc':>10} {'F1 Macro':>10} {'Replan%':>10}"
-    logger.info(header)
-    logger.info("-" * 80)
-    for name, results in all_ablation_results.items():
-        for split, m in results.items():
-            if isinstance(m, dict):
-                row = (
-                    f"  {name:<25} "
-                    f"{m.get('element_accuracy', 0):.4f}     "
-                    f"{m.get('action_accuracy', 0):.4f}     "
-                    f"{m.get('f1/macro', 0):.4f}     "
-                    f"{m.get('replan_fraction', 0):.4f}"
+        for i, sample in enumerate(eval_samples):
+            try:
+                # Build prompt
+                messages = prompt_builder.build_chat_messages(
+                    task=sample.task,
+                    serialized_dom=sample.serialized_dom,
+                    action_history=sample.action_history,
+                    screenshot_placeholder=sample.screenshot is not None,
+                    extra_context=f"Website: {sample.website}" if sample.website else "",
                 )
-                logger.info(row)
 
-    return all_ablation_results
+                # Generate with timing
+                start = time.time()
+                result = model.generate(
+                    messages=messages,
+                    image=sample.screenshot,
+                    return_log_probs=True,
+                )
+                latency_ms = (time.time() - start) * 1000
 
+                # Parse prediction
+                pred_action = action_decoder.parse(result["text"])
+                if pred_action is None:
+                    pred_action = {"action": "UNKNOWN"}
 
-# ── CLI ──────────────────────────────────────────────────────
+                # Evaluate
+                self.evaluate_step(
+                    predicted=pred_action,
+                    ground_truth=sample.action,
+                    latency_ms=latency_ms,
+                    log_prob=result.get("avg_log_prob", 0.0),
+                )
+
+            except Exception as e:
+                logger.warning(f"Eval failed for sample {i}: {e}")
+                self.step_results.append(StepResult(
+                    ground_truth_action=sample.action,
+                    parse_success=False,
+                ))
+
+            if (i + 1) % 50 == 0:
+                logger.info(f"Evaluated {i + 1}/{len(eval_samples)}")
+
+        return self.compute_metrics()
+
+    def compute_metrics(self) -> Dict[str, Any]:
+        """
+        Compute all evaluation metrics.
+
+        Returns dict with:
+          - element_accuracy
+          - action_accuracy
+          - full_match_accuracy
+          - per_action_f1
+          - mean_latency_ms
+          - failure_breakdown
+          - parse_success_rate
+        """
+        if not self.step_results:
+            return {}
+
+        total = len(self.step_results)
+        valid = [r for r in self.step_results if r.parse_success]
+
+        metrics: Dict[str, Any] = {
+            "total_samples": total,
+            "valid_samples": len(valid),
+            "parse_success_rate": len(valid) / total,
+        }
+
+        if valid:
+            metrics["element_accuracy"] = sum(1 for r in valid if r.element_correct) / len(valid)
+            metrics["action_accuracy"] = sum(1 for r in valid if r.action_correct) / len(valid)
+            metrics["value_accuracy"] = sum(1 for r in valid if r.value_correct) / len(valid)
+            metrics["full_match_accuracy"] = sum(1 for r in valid if r.full_match) / len(valid)
+
+            latencies = [r.latency_ms for r in valid if r.latency_ms > 0]
+            if latencies:
+                metrics["mean_latency_ms"] = sum(latencies) / len(latencies)
+                metrics["p95_latency_ms"] = sorted(latencies)[int(len(latencies) * 0.95)]
+
+            log_probs = [r.log_prob for r in valid if r.log_prob != 0]
+            if log_probs:
+                metrics["mean_log_prob"] = sum(log_probs) / len(log_probs)
+
+        # Per-action metrics
+        metrics["per_action"] = self._per_action_metrics(valid)
+
+        # Failure breakdown
+        metrics["failure_breakdown"] = self._failure_breakdown(valid)
+
+        return metrics
+
+    def _per_action_metrics(self, results: List[StepResult]) -> Dict[str, Dict[str, float]]:
+        """Compute per-action-type precision, recall, and F1."""
+        per_action: Dict[str, Dict[str, int]] = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
+
+        for r in results:
+            gt_action = r.ground_truth_action.get("action", "").upper()
+            pred_action = r.predicted_action.get("action", "").upper()
+
+            if pred_action == gt_action:
+                per_action[gt_action]["tp"] += 1
+            else:
+                per_action[gt_action]["fn"] += 1
+                per_action[pred_action]["fp"] += 1
+
+        metrics = {}
+        for action_type in self.action_types + ["UNKNOWN", "DONE"]:
+            counts = per_action.get(action_type, {"tp": 0, "fp": 0, "fn": 0})
+            tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            if tp + fp + fn > 0:
+                metrics[action_type] = {
+                    "precision": round(precision, 4),
+                    "recall": round(recall, 4),
+                    "f1": round(f1, 4),
+                    "support": tp + fn,
+                }
+
+        return metrics
+
+    def _failure_breakdown(self, results: List[StepResult]) -> Dict[str, int]:
+        """Breakdown of failure types."""
+        failures = defaultdict(int)
+        for r in results:
+            if r.full_match:
+                continue
+            if not r.action_correct:
+                failures["wrong_action_type"] += 1
+            elif not r.element_correct:
+                failures["wrong_element"] += 1
+            elif not r.value_correct:
+                failures["wrong_value"] += 1
+        failures["total_failures"] = sum(failures.values())
+        return dict(failures)
+
+    def reset(self):
+        """Reset all stored results."""
+        self.results.clear()
+        self.step_results.clear()
+
+    def print_report(self, metrics: Dict[str, Any]) -> None:
+        """Print a human-readable evaluation report."""
+        print("\n" + "=" * 60)
+        print("  VLA Web Agent — Evaluation Report")
+        print("=" * 60)
+
+        print(f"\n  Total samples:      {metrics.get('total_samples', 0)}")
+        print(f"  Parse success rate: {metrics.get('parse_success_rate', 0):.1%}")
+        print(f"\n  Element accuracy:   {metrics.get('element_accuracy', 0):.1%}")
+        print(f"  Action accuracy:    {metrics.get('action_accuracy', 0):.1%}")
+        print(f"  Value accuracy:     {metrics.get('value_accuracy', 0):.1%}")
+        print(f"  Full match:         {metrics.get('full_match_accuracy', 0):.1%}")
+
+        if "mean_latency_ms" in metrics:
+            print(f"\n  Mean latency:       {metrics['mean_latency_ms']:.0f}ms")
+            print(f"  P95 latency:        {metrics.get('p95_latency_ms', 0):.0f}ms")
+
+        if "per_action" in metrics:
+            print("\n  Per-Action F1:")
+            for action, m in metrics["per_action"].items():
+                print(f"    {action:10s}  P={m['precision']:.3f}  R={m['recall']:.3f}  F1={m['f1']:.3f}  N={m['support']}")
+
+        if "failure_breakdown" in metrics:
+            print("\n  Failure Breakdown:")
+            for ftype, count in metrics["failure_breakdown"].items():
+                print(f"    {ftype:25s}: {count}")
+
+        print("\n" + "=" * 60)
+
 
 def main():
+    """Main evaluation entry point."""
     import argparse
-    parser = argparse.ArgumentParser(description="VLA Agent Evaluation (Refactored)")
+
+    parser = argparse.ArgumentParser(description="VLA Web Agent Evaluation")
     parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--split", type=str, default="test_task")
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--splits", nargs="+", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--output", type=str, default="results.json")
-    parser.add_argument(
-        "--ablation", type=str, default="full",
-        choices=list(ABLATION_PRESETS.keys()) + ["all"],
-    )
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    from utils.config import load_config
+    from utils.logging import get_logger
+    from models.vla_model import VLAModel
+    from models.prompt_builder import PromptBuilder
+    from models.action_decoder import ActionDecoder
+    from data.mind2web_loader import Mind2WebLoader
 
-    if args.ablation == "all":
-        run_all_ablations(
-            config=config,
-            checkpoint_path=args.checkpoint,
-            device=args.device,
-            max_samples=args.max_samples,
-        )
-    else:
-        evaluator = Evaluator(
-            config=config,
-            checkpoint_path=args.checkpoint,
-            device=args.device,
-            ablation=ABLATION_PRESETS[args.ablation],
-        )
-        evaluator.evaluate(
-            splits=args.splits,
-            max_samples=args.max_samples,
-            output_path=args.output,
-        )
+    config = load_config(args.config)
+    log = get_logger("vla.eval")
+
+    # Load model
+    model = VLAModel(config=config, device=args.device)
+    model.load()
+    if args.checkpoint:
+        model.load_lora(args.checkpoint)
+
+    # Load test data
+    loader = Mind2WebLoader(dataset_name=config.data.dataset_name)
+    test_samples = loader.build_training_examples(
+        split=args.split,
+        max_samples=args.max_samples,
+        include_screenshot=True,
+    )
+    log.info(f"Loaded {len(test_samples)} test samples from {args.split}")
+
+    # Evaluate
+    evaluator = VLAEvaluator()
+    prompt_builder = PromptBuilder()
+    decoder = ActionDecoder()
+
+    metrics = evaluator.evaluate_batch(
+        model=model,
+        samples=test_samples,
+        prompt_builder=prompt_builder,
+        action_decoder=decoder,
+        max_samples=args.max_samples,
+    )
+
+    evaluator.print_report(metrics)
+
+    # Save results
+    import json
+    with open("evaluation_results.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    log.info("Results saved to evaluation_results.json")
 
 
 if __name__ == "__main__":

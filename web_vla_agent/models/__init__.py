@@ -1,5 +1,7 @@
-# models package — refactored VLA Web Agent
-from models.graph_dom_encoder import GraphDOMEncoder
-from models.grounder import VLAGrounder, VLAGrounderBatched
-from models.uncertainty import EntropyUncertainty
-from models.encoders import TextEncoder, VisionEncoder
+"""VLA Web Agent — Models Package."""
+from models.vla_model import VLAModel
+from models.prompt_builder import PromptBuilder
+from models.action_decoder import ActionDecoder
+from models.uncertainty import TokenUncertainty
+
+__all__ = ["VLAModel", "PromptBuilder", "ActionDecoder", "TokenUncertainty"]
