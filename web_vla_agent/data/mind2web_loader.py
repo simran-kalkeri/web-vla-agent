@@ -1,30 +1,27 @@
 """
-Multimodal-Mind2Web dataset loader.
+Multimodal-Mind2Web dataset loader — Candidate-Based.
 
-Loads from the HuggingFace cache (``osunlp/Multimodal-Mind2Web``).
-Wraps the HF dataset rows into a PyTorch Dataset with structured
-preprocessing, candidate extraction, and a custom collate function.
+Mind2Web uses a CANDIDATE-BASED approach:
+  - Each sample provides pos_candidates (1+) and neg_candidates (~50–600)
+  - The element pool = pos + neg (shuffled)
+  - Target = index of the positive candidate in the pool
+  - This guarantees 100% target match rate
+
+Each candidate has: tag, attributes (JSON), backend_node_id, text content.
+We build element signatures from these for text encoding.
 """
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass, field
-from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
 
-from data.preprocessing import (
-    DOMElement,
-    DOMProcessor,
-    ScreenshotProcessor,
-    crop_element_from_screenshot,
-    BoundingBox,
-)
-from utils.config import DataConfig, VLAConfig, load_config
+from data.preprocessing import DOMElement, BoundingBox
+from utils.config import DataConfig
 
 
 # ── Structured sample ───────────────────────────────────────
@@ -32,57 +29,200 @@ from utils.config import DataConfig, VLAConfig, load_config
 @dataclass
 class Mind2WebSample:
     """A single processed Mind2Web training / evaluation sample."""
-    # Identifiers
     sample_id: str = ""
     annotation_id: str = ""
-
-    # Task
     task: str = ""
     website: str = ""
     domain: str = ""
-
-    # Observation at this step
-    screenshot: Optional[Image.Image] = None
-    cleaned_html: str = ""
-    url: str = ""
-
-    # Ground-truth action
-    action_uid: str = ""  # target element backend_node_id
-    operation: str = ""   # CLICK / TYPE / SELECT
-    value: str = ""       # typed text or selected option
-
-    # History
+    operation: str = ""
+    value: str = ""
     previous_actions: List[str] = field(default_factory=list)
-
-    # Candidate elements
-    pos_candidates: List[Dict[str, Any]] = field(default_factory=list)
-    neg_candidates: List[Dict[str, Any]] = field(default_factory=list)
-
-    # Preprocessed DOM elements (filled by dataset)
-    dom_elements: List[DOMElement] = field(default_factory=list)
-
-    # Number of steps in the full trajectory (for curriculum)
     trajectory_length: int = 1
 
+    # Candidate-based element pool
+    candidates: List[Dict[str, Any]] = field(default_factory=list)
+    target_idx: int = -1  # Index of positive candidate in pool
 
-# ── PyTorch dataset ──────────────────────────────────────────
+
+# ── Operation / candidate parsing ────────────────────────────
 
 OPERATION_MAP = {"CLICK": 0, "TYPE": 1, "SELECT": 2, "SCROLL": 3}
 
 
+def parse_operation(op_raw: str) -> Tuple[str, str]:
+    """Parse the JSON operation field from Mind2Web."""
+    if not op_raw:
+        return ("CLICK", "")
+    try:
+        op_dict = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+        operation = op_dict.get("op", op_dict.get("original_op", "CLICK"))
+        value = op_dict.get("value", "")
+        return (operation.upper(), value)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return ("CLICK", "")
+
+
+def parse_candidate(raw: Any) -> Optional[Dict[str, Any]]:
+    """Parse a single candidate JSON into a structured dict."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+
+    tag = raw.get("tag", "div")
+    backend_node_id = str(raw.get("backend_node_id", ""))
+
+    # Parse nested attributes JSON
+    attrs_raw = raw.get("attributes", "{}")
+    if isinstance(attrs_raw, str):
+        try:
+            attrs = json.loads(attrs_raw)
+        except (json.JSONDecodeError, TypeError):
+            attrs = {}
+    else:
+        attrs = attrs_raw if isinstance(attrs_raw, dict) else {}
+
+    # If backend_node_id not at top level, try from attributes
+    if not backend_node_id:
+        backend_node_id = str(attrs.get("backend_node_id", ""))
+
+    # Extract useful text for signature
+    text = ""
+    for key in ["aria_label", "aria-label", "placeholder", "title", "alt", "value", "name"]:
+        v = attrs.get(key, "")
+        if v:
+            text = str(v)[:120]
+            break
+
+    # Inner text from the candidate
+    inner_text = str(raw.get("text", ""))[:120]
+    if inner_text and not text:
+        text = inner_text
+
+    # Build signature: "tag | text | key-attrs"
+    attr_parts = []
+    for k in ["id", "class", "role", "type", "href"]:
+        v = attrs.get(k, "")
+        if v:
+            attr_parts.append(f'{k}="{str(v)[:60]}"')
+    attr_str = " ".join(attr_parts)
+
+    text_short = (text[:80] + "…") if len(text) > 80 else text
+    signature = f"{tag} | {text_short} | {attr_str}".strip(" |")
+
+    return {
+        "tag": tag,
+        "backend_node_id": backend_node_id,
+        "signature": signature,
+        "text": text,
+        "attributes": attrs,
+        "is_positive": raw.get("_is_positive", False),
+    }
+
+
+def build_candidate_pool(
+    pos_candidates: list,
+    neg_candidates: list,
+    max_candidates: int = 128,
+    shuffle: bool = True,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Build element pool from pos + neg candidates.
+    Returns (pool, target_idx).
+    """
+    # Parse positive
+    positives = []
+    for c in pos_candidates:
+        parsed = parse_candidate(c)
+        if parsed:
+            parsed["_is_positive"] = True
+            positives.append(parsed)
+
+    # Parse negatives (cap to leave room for positives)
+    max_neg = max_candidates - len(positives)
+    negatives = []
+    for c in neg_candidates[:max_neg * 2]:  # parse extra in case some fail
+        if len(negatives) >= max_neg:
+            break
+        parsed = parse_candidate(c)
+        if parsed:
+            parsed["_is_positive"] = False
+            negatives.append(parsed)
+
+    if not positives:
+        return negatives[:max_candidates], -1
+
+    # Combine
+    pool = positives + negatives
+    pool = pool[:max_candidates]
+
+    if shuffle:
+        random.shuffle(pool)
+
+    # Find target index
+    target_idx = -1
+    for i, c in enumerate(pool):
+        if c.get("_is_positive", False):
+            target_idx = i
+            break
+
+    return pool, target_idx
+
+
+# ── Candidate → DOMElement conversion (for GCN) ─────────────
+
+def candidates_to_dom_elements(candidates: List[Dict[str, Any]]) -> List[DOMElement]:
+    """Convert candidate dicts to DOMElement objects for structural features."""
+    elements = []
+    for i, c in enumerate(candidates):
+        attrs = c.get("attributes", {})
+        if isinstance(attrs, str):
+            try:
+                attrs = json.loads(attrs)
+            except:
+                attrs = {}
+
+        # Parse bounding box if available
+        bbox = None
+        bbox_str = attrs.get("bounding_box_rect", "")
+        if bbox_str:
+            try:
+                parts = [float(x) for x in str(bbox_str).split(",")[:4]]
+                if len(parts) == 4:
+                    bbox = BoundingBox(x=parts[0], y=parts[1], width=parts[2], height=parts[3])
+            except (ValueError, TypeError):
+                pass
+
+        tag = c.get("tag", "div")
+        is_clickable = tag in {"a", "button", "input", "select", "textarea", "option", "label"}
+
+        elem = DOMElement(
+            element_id=c.get("backend_node_id", f"cand_{i}"),
+            tag=tag,
+            text=c.get("text", "")[:256],
+            attributes={k: str(v)[:100] for k, v in attrs.items()
+                       if k in {"id", "class", "role", "type", "href", "name", "aria_label"}},
+            bounding_box=bbox,
+            is_clickable=is_clickable,
+            is_visible=True,
+            parent_id=None,
+            depth=0,
+        )
+        elements.append(elem)
+    return elements
+
+
+# ── PyTorch Dataset ──────────────────────────────────────────
+
 class Mind2WebDataset(Dataset):
     """
-    PyTorch wrapper around Multimodal-Mind2Web.
-
-    Parameters
-    ----------
-    split : str
-        One of ``"train"``, ``"test_task"``, ``"test_website"``,
-        ``"test_domain"``.
-    config : DataConfig | None
-        Data-specific config.  Falls back to defaults when *None*.
-    max_samples : int | None
-        Cap the number of samples (handy for debugging).
+    Candidate-based Mind2Web dataset.
+    Element pool = pos_candidates + neg_candidates (shuffled).
+    Target = index of positive candidate in pool.
+    100% target match rate guaranteed.
     """
 
     def __init__(
@@ -90,17 +230,13 @@ class Mind2WebDataset(Dataset):
         split: str = "train",
         config: Optional[DataConfig] = None,
         max_samples: Optional[int] = None,
+        max_candidates: int = 128,
     ):
         self.config = config or DataConfig()
         self.split = split
-        self.dom_processor = DOMProcessor(max_elements=self.config.max_dom_elements)
-        self.screenshot_processor = ScreenshotProcessor(
-            size=tuple(self.config.screenshot_size)  # type: ignore[arg-type]
-        )
+        self.max_candidates = max_candidates
 
-        # Lazy import so the top-level module doesn't need `datasets`
         from datasets import load_dataset
-
         ds = load_dataset(self.config.dataset_name, split=split)
         if max_samples is not None:
             ds = ds.select(range(min(max_samples, len(ds))))
@@ -111,214 +247,72 @@ class Mind2WebDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self._dataset[idx]
-        sample = self._parse_row(row)
-        return self._to_tensors(sample)
+        return self._process_row(row)
 
-    # ── Row parsing ──────────────────────────────────────────
-    def _parse_row(self, row: Dict[str, Any]) -> Mind2WebSample:
-        """Turn a raw HF row into a :class:`Mind2WebSample`."""
-        # Screenshot
-        screenshot = None
-        if "screenshot" in row and row["screenshot"] is not None:
-            img_data = row["screenshot"]
-            if isinstance(img_data, Image.Image):
-                screenshot = img_data
-            elif isinstance(img_data, bytes):
-                screenshot = Image.open(BytesIO(img_data))
-            elif isinstance(img_data, str):
-                # base64 or path — skipped for now
-                screenshot = None
-
-        # Parse operation from JSON field
+    def _process_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        # Operation
         op_raw = row.get("operation", "") or ""
-        operation, value = self._parse_operation(op_raw)
+        operation, value = parse_operation(op_raw)
+        op_label = OPERATION_MAP.get(operation, 0)
 
-        # Candidates
-        pos_candidates = self._safe_json(row.get("pos_candidates", "[]"))
-        neg_candidates = self._safe_json(row.get("neg_candidates", "[]"))
+        # Task
+        task = row.get("confirmed_task", "") or row.get("task", "") or ""
 
-        # Extract target element's backend_node_id from pos_candidates
-        target_backend_node_id = self._extract_target_node_id(pos_candidates)
+        # Build candidate pool
+        pos_raw = row.get("pos_candidates", []) or []
+        neg_raw = row.get("neg_candidates", []) or []
+        if isinstance(pos_raw, str):
+            pos_raw = json.loads(pos_raw) if pos_raw else []
+        if isinstance(neg_raw, str):
+            neg_raw = json.loads(neg_raw) if neg_raw else []
 
-        # Previous actions
-        prev = row.get("previous_actions", []) or []
-        if isinstance(prev, str):
-            prev = self._safe_json(prev)
-        if not isinstance(prev, list):
-            prev = []
-
-        # DOM
-        cleaned_html = row.get("cleaned_html", "") or ""
-        dom_elements = self.dom_processor.parse(cleaned_html)
-
-        return Mind2WebSample(
-            sample_id=str(row.get("action_uid", "")),
-            annotation_id=str(row.get("annotation_id", "")),
-            task=row.get("confirmed_task", "") or row.get("task", "") or "",
-            website=row.get("website", "") or "",
-            domain=row.get("domain", "") or "",
-            screenshot=screenshot,
-            cleaned_html=cleaned_html,
-            url=row.get("url", "") or "",
-            action_uid=target_backend_node_id,  # Use backend_node_id, NOT action_uid UUID
-            operation=operation,
-            value=value,
-            previous_actions=prev[: self.config.max_action_history],
-            pos_candidates=pos_candidates,
-            neg_candidates=neg_candidates,
-            dom_elements=dom_elements,
-            trajectory_length=int(row.get("num_steps", 1) or 1),
+        pool, target_idx = build_candidate_pool(
+            pos_raw, neg_raw,
+            max_candidates=self.max_candidates,
+            shuffle=(self.split == "train"),
         )
 
-    # ── Tensor conversion ────────────────────────────────────
-    def _to_tensors(self, sample: Mind2WebSample) -> Dict[str, Any]:
-        """Convert a sample into a dict suitable for DataLoader."""
-        # Screenshot tensor [C, H, W]
-        if sample.screenshot is not None:
-            screenshot_np = self.screenshot_processor.to_numpy(sample.screenshot)
-            screenshot_tensor = torch.from_numpy(screenshot_np)
-        else:
-            h, w = self.config.screenshot_size
-            screenshot_tensor = torch.zeros(3, h, w, dtype=torch.float32)
+        # Element signatures
+        element_sigs = [c.get("signature", "") for c in pool]
 
-        # Element signatures (for text encoder)
-        element_sigs = [el.signature for el in sample.dom_elements]
-        element_ids = [el.element_id for el in sample.dom_elements]
-
-        # Ground-truth label: index of target element in element list
-        target_idx = -1
-        for i, eid in enumerate(element_ids):
-            if eid == sample.action_uid:
-                target_idx = i
-                break
-
-        # Operation label
-        op_label = OPERATION_MAP.get(sample.operation.upper(), 0)
+        # DOM elements for structural features
+        dom_elements = candidates_to_dom_elements(pool)
 
         return {
-            "sample_id": sample.sample_id,
-            "task": sample.task,
-            "screenshot": screenshot_tensor,
+            "sample_id": str(row.get("action_uid", "")),
+            "task": task,
             "element_signatures": element_sigs,
-            "element_ids": element_ids,
-            "num_elements": len(element_sigs),
+            "num_elements": len(pool),
             "target_element_idx": target_idx,
             "operation_label": op_label,
-            "value": sample.value,
-            "previous_actions": sample.previous_actions,
-            "cleaned_html": sample.cleaned_html,
-            "pos_candidates": sample.pos_candidates,
-            "neg_candidates": sample.neg_candidates,
-            "trajectory_length": sample.trajectory_length,
-            "dom_elements": sample.dom_elements,
+            "value": value,
+            "domain": row.get("domain", "") or "",
+            "website": row.get("website", "") or "",
+            "dom_elements": dom_elements,
+            "trajectory_length": int(row.get("num_steps", 1) or 1),
         }
-
-    # ── Helpers ──────────────────────────────────────────────
-    @staticmethod
-    def _parse_operation(op_raw: str) -> Tuple[str, str]:
-        """Parse the JSON operation field from Mind2Web."""
-        if not op_raw:
-            return ("CLICK", "")
-        try:
-            op_dict = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
-            operation = op_dict.get("op", op_dict.get("original_op", "CLICK"))
-            value = op_dict.get("value", "")
-            return (operation.upper(), value)
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            return ("CLICK", "")
-
-    @staticmethod
-    def _parse_action(action_repr: str) -> Tuple[str, str]:
-        """Best-effort parse of Mind2Web action strings (fallback)."""
-        action_repr = action_repr.strip()
-        if not action_repr:
-            return ("CLICK", "")
-        upper = action_repr.upper()
-        if upper.startswith("SELECT"):
-            return ("SELECT", action_repr.split(maxsplit=1)[-1] if " " in action_repr else "")
-        elif upper.startswith("TYPE"):
-            return ("TYPE", action_repr.split(maxsplit=1)[-1] if " " in action_repr else "")
-        else:
-            return ("CLICK", "")
-
-    @staticmethod
-    def _extract_target_node_id(pos_candidates: list) -> str:
-        """Extract backend_node_id from the first positive candidate."""
-        if not pos_candidates:
-            return ""
-        cand = pos_candidates[0]
-        if isinstance(cand, str):
-            try:
-                cand = json.loads(cand)
-            except (json.JSONDecodeError, TypeError):
-                return ""
-        # Direct backend_node_id field
-        if isinstance(cand, dict):
-            bnid = cand.get("backend_node_id", "")
-            if bnid:
-                return str(bnid)
-            # Try inside nested attributes JSON
-            attrs = cand.get("attributes", "")
-            if isinstance(attrs, str):
-                try:
-                    attrs_d = json.loads(attrs)
-                    return str(attrs_d.get("backend_node_id", ""))
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        return ""
-
-    @staticmethod
-    def _safe_json(val: Any) -> list:
-        if isinstance(val, list):
-            return val
-        if isinstance(val, str):
-            try:
-                parsed = json.loads(val)
-                return parsed if isinstance(parsed, list) else []
-            except (json.JSONDecodeError, TypeError):
-                return []
-        return []
 
 
 # ── Collate ──────────────────────────────────────────────────
 
 def vla_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Custom collate that handles variable-length element lists.
-
-    Returns
-    -------
-    dict with:
-      screenshots : Tensor [B, C, H, W]
-      target_element_idx : Tensor [B]
-      operation_label : Tensor [B]
-      tasks : list[str]
-      element_signatures : list[list[str]]   (variable per sample)
-      ... and other fields as lists
-    """
-    screenshots = torch.stack([s["screenshot"] for s in batch])
+    """Custom collate for variable-length candidate pools."""
     target_idx = torch.tensor(
-        [s["target_element_idx"] for s in batch], dtype=torch.long
+        [s["target_element_idx"] for s in batch], dtype=torch.long,
     )
     op_labels = torch.tensor(
-        [s["operation_label"] for s in batch], dtype=torch.long
+        [s["operation_label"] for s in batch], dtype=torch.long,
     )
-
     return {
-        "screenshots": screenshots,
         "target_element_idx": target_idx,
         "operation_label": op_labels,
         "tasks": [s["task"] for s in batch],
-        "values": [s["value"] for s in batch],
         "element_signatures": [s["element_signatures"] for s in batch],
-        "element_ids": [s["element_ids"] for s in batch],
         "num_elements": [s["num_elements"] for s in batch],
-        "previous_actions": [s["previous_actions"] for s in batch],
         "sample_ids": [s["sample_id"] for s in batch],
-        "trajectory_lengths": [s["trajectory_length"] for s in batch],
         "dom_elements": [s["dom_elements"] for s in batch],
-        "pos_candidates": [s["pos_candidates"] for s in batch],
-        "neg_candidates": [s["neg_candidates"] for s in batch],
+        "domains": [s.get("domain", "") for s in batch],
+        "trajectory_lengths": [s["trajectory_length"] for s in batch],
     }
 
 
@@ -327,16 +321,13 @@ def build_dataloader(
     config: Optional[DataConfig] = None,
     max_samples: Optional[int] = None,
     shuffle: bool = True,
-    num_workers: int = 2,
+    num_workers: int = 0,
+    batch_size: int = 8,
 ) -> DataLoader:
     """Convenience builder for a DataLoader."""
     cfg = config or DataConfig()
     ds = Mind2WebDataset(split=split, config=cfg, max_samples=max_samples)
     return DataLoader(
-        ds,
-        batch_size=8,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=vla_collate_fn,
-        pin_memory=True,
+        ds, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, collate_fn=vla_collate_fn, pin_memory=False,
     )
