@@ -1,189 +1,100 @@
-<![CDATA[<div align="center">
+# Web VLA Agent
 
-# 🌐 Web VLA Agent
+**End-to-End Vision-Language-Action Agent for Autonomous Web Navigation**
 
-### End-to-End Vision-Language-Action Agent for Autonomous Web Navigation
+A multimodal agent that sees, understands, and acts on real web pages — trained end-to-end on human demonstrations using Qwen2-VL as its backbone.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Qwen2-VL](https://img.shields.io/badge/Backbone-Qwen2--VL--2B-purple.svg)](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct)
-[![Dataset](https://img.shields.io/badge/Data-Mind2Web-orange.svg)](https://huggingface.co/datasets/osunlp/Multimodal-Mind2Web)
-
-*A multimodal agent that sees, understands, and acts on real web pages — trained end-to-end on human demonstrations.*
-
-</div>
-
----
-
-## 📋 Table of Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [System Diagram](#system-diagram)
-- [Project Structure](#project-structure)
-- [Components](#components)
-  - [Model Layer](#1-model-layer)
-  - [Data Pipeline](#2-data-pipeline)
-  - [Browser Environment](#3-browser-environment)
-  - [Training Pipeline](#4-training-pipeline)
-  - [Evaluation](#5-evaluation)
-  - [Inference Engine](#6-inference-engine)
-  - [Memory & Safety](#7-memory--safety)
-  - [Utilities](#8-utilities)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Training Guide](#training-guide)
-- [Evaluation Guide](#evaluation-guide)
-- [Action Space](#action-space)
-- [Research Contributions](#research-contributions)
-- [License](#license)
+| | |
+|---|---|
+| **Model** | Qwen2-VL-2B-Instruct (QLoRA fine-tuned) |
+| **Dataset** | Multimodal-Mind2Web (137 websites, 31 domains) |
+| **Actions** | CLICK · TYPE · SELECT · SCROLL · DONE |
+| **Python** | 3.10+ |
+| **License** | MIT |
 
 ---
 
-## Overview
+## Table of Contents
 
-**Web VLA Agent** is a Vision-Language-Action (VLA) system that autonomously navigates and interacts with real web pages. Given a natural language instruction (e.g., *"Book a one-way flight from NYC to LA for next Friday"*), the agent:
-
-1. **Observes** the webpage via screenshot + structured DOM
-2. **Reasons** about which element to interact with and how
-3. **Acts** by clicking, typing, selecting, or scrolling
-4. **Repeats** until the task is complete
-
-The system uses **Qwen2-VL-2B-Instruct** as its multimodal backbone, fine-tuned with **QLoRA** (4-bit quantization + LoRA adapters) on the **Multimodal-Mind2Web** dataset — a large-scale collection of human web navigation demonstrations spanning 137 websites across 31 domains.
-
-### Key Features
-
-| Feature | Description |
-|---------|-------------|
-| 🧠 **Multimodal Understanding** | Jointly processes screenshots (visual) + DOM tree (structural) via full cross-attention |
-| 🎯 **Structured Action Generation** | Outputs validated JSON actions via autoregressive decoding, not classification |
-| 📊 **Uncertainty Estimation** | Token-level log probability + beam disagreement for confidence-aware decisions |
-| 🔄 **Multi-Stage Training** | Stage 1: single-step imitation → Stage 2: multi-step trajectories with teacher forcing |
-| 🛡️ **Failure Detection** | Heuristic loop/stale/error detection triggers replanning |
-| 🧪 **Domain Augmentation** | DOM perturbation + visual augmentation for cross-domain generalization |
-| ⚡ **Efficient Fine-Tuning** | 4-bit QLoRA enables training on consumer GPUs (< 16GB VRAM) |
+1. [What It Does](#what-it-does)
+2. [Architecture Overview](#architecture-overview)
+3. [Project Structure](#project-structure)
+4. [Component Details](#component-details)
+5. [Installation](#installation)
+6. [Usage](#usage)
+7. [Configuration](#configuration)
+8. [Training Guide](#training-guide)
+9. [Evaluation](#evaluation)
+10. [Action Space](#action-space)
+11. [Research Highlights](#research-highlights)
 
 ---
 
-## Architecture
+## What It Does
 
-The agent follows a **perceive → reason → act** loop built around a single multimodal transformer:
+Given a natural language instruction like *"Book a one-way flight from NYC to LA for next Friday"*, the agent:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        VLA Agent Loop                           │
-│                                                                 │
-│  ┌──────────┐    ┌──────────────┐    ┌────────────────────┐     │
-│  │  Browser  │───▶│  Observation │───▶│   Qwen2-VL + QLoRA │     │
-│  │  (state)  │    │  (DOM + img) │    │   (reasoning)      │     │
-│  └────▲─────┘    └──────────────┘    └────────┬───────────┘     │
-│       │                                       │                 │
-│       │          ┌──────────────┐              │                 │
-│       │          │  Uncertainty │◀─────────────┤                 │
-│       │          │  Estimator   │              │                 │
-│       │          └──────┬───────┘              │                 │
-│       │                 │ confident?           ▼                 │
-│       │                 │              ┌──────────────┐          │
-│       │                 └─────────────▶│ Action Decoder│          │
-│       │                                │ (JSON parse) │          │
-│       │                                └──────┬───────┘          │
-│       │                                       │                 │
-│       └───────────────────────────────────────┘                 │
-│                    execute action                               │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Model Architecture
-
-The core model is a **LLaVA-style multimodal transformer**:
-
-```
-Screenshot (PIL Image)         Structured DOM Text
-        │                              │
-        ▼                              ▼
-┌───────────────┐            ┌──────────────────┐
-│ Vision Encoder │            │   Text Tokenizer  │
-│ (ViT patches)  │            │   (Qwen2 BPE)    │
-└───────┬───────┘            └────────┬─────────┘
-        │                              │
-        ▼                              ▼
-┌───────────────────────────────────────────────┐
-│        Cross-Attention Transformer             │
-│    (all tokens fully attend to each other)     │
-│                                                │
-│    [vision patches] [task] [DOM] [history]     │
-│                                                │
-│    QLoRA: 4-bit quantized weights              │
-│    + LoRA on q/k/v/o + gate/up/down projections│
-└───────────────────┬───────────────────────────┘
-                    │
-                    ▼
-           JSON Action Token
-    {"action": "CLICK", "element_id": 32}
-```
+1. **Observes** the webpage — captures a screenshot and extracts the DOM tree
+2. **Reasons** about which element to interact with — using a multimodal transformer
+3. **Acts** — clicks, types, selects, or scrolls on the page
+4. **Repeats** — loops until the task is complete or max steps are reached
 
 ---
 
-## System Diagram
+## Architecture Overview
+
+The system follows a **perceive → reason → act** loop:
 
 ```mermaid
-graph TB
-    subgraph Input
-        A["🗣️ Task Instruction"]
-        B["🖥️ Live Web Page"]
-    end
-
-    subgraph Browser["Browser Environment (Playwright)"]
-        C["DOM Serializer"]
-        D["Screenshot Capture"]
-        E["Action Executor"]
-    end
-
-    subgraph Model["VLA Model (Qwen2-VL)"]
-        F["Vision Encoder (ViT)"]
-        G["Language Model (QLoRA)"]
-        H["Prompt Builder"]
-    end
-
-    subgraph Safety["Safety & Confidence"]
-        I["Uncertainty Estimator"]
-        J["Failure Detector"]
-    end
-
-    subgraph Output
-        K["Action Decoder"]
-        L["JSON Action"]
-    end
-
-    subgraph Training["Training Pipeline"]
-        M["Mind2Web Loader"]
-        N["Data Augmentation"]
-        O["Multi-Stage Trainer"]
-    end
-
-    A --> H
-    B --> C & D
-    C --> H
-    D --> F
-    H --> G
-    F --> G
-    G --> K
-    G --> I
-    I -->|"confident"| K
-    I -->|"uncertain"| G
-    K --> L
-    L --> E
-    E --> B
-    J --> E
-
-    M --> N --> O --> G
-
-    style Model fill:#1a1b27,stroke:#bc8cff,color:#fff
-    style Browser fill:#1a1b27,stroke:#58a6ff,color:#fff
-    style Safety fill:#1a1b27,stroke:#d29922,color:#fff
-    style Training fill:#1a1b27,stroke:#3fb950,color:#fff
+flowchart LR
+    A[Web Page] -->|screenshot + DOM| B[Observation]
+    B --> C[Qwen2-VL + QLoRA]
+    C --> D{Confident?}
+    D -->|yes| E[Action Decoder]
+    D -->|no, regenerate| C
+    E --> F[Execute in Browser]
+    F --> A
 ```
+
+### How the Model Works
+
+The core is a **Qwen2-VL-2B** multimodal transformer, fine-tuned with 4-bit QLoRA:
+
+```
+Inputs:
+  ┌─────────────────┐   ┌──────────────────────────────┐
+  │  Screenshot      │   │  Structured DOM + Task +      │
+  │  (Vision Encoder)│   │  Action History (Tokenizer)   │
+  └────────┬────────┘   └──────────────┬───────────────┘
+           │                           │
+           └───────────┬───────────────┘
+                       ▼
+           ┌───────────────────────┐
+           │  Cross-Attention       │
+           │  Transformer (QLoRA)   │
+           │                        │
+           │  All tokens attend to  │
+           │  all other tokens      │
+           └───────────┬───────────┘
+                       ▼
+           ┌───────────────────────┐
+           │  Autoregressive JSON   │
+           │  Action Generation     │
+           └───────────────────────┘
+
+Output:
+  {"action": "CLICK", "element_id": 32}
+```
+
+### QLoRA Setup
+
+| Parameter | Value |
+|-----------|-------|
+| Quantization | 4-bit NF4 |
+| LoRA rank (r) | 16 |
+| LoRA alpha | 32 |
+| LoRA dropout | 0.05 |
+| Target modules | q/k/v/o_proj, gate/up/down_proj |
 
 ---
 
@@ -191,172 +102,166 @@ graph TB
 
 ```
 web_vla_agent/
-├── main.py                          # Entry point & CLI dispatcher
-├── pyproject.toml                   # Package config & dependencies
+│
+├── main.py                       # CLI entry point
+├── pyproject.toml                # Package config & dependencies
 ├── configs/
-│   └── default.yaml                 # Full configuration (model, training, data, env)
+│   └── default.yaml              # All hyperparameters
 │
-├── models/                          # 🧠 Core model layer
-│   ├── vla_model.py                 # Qwen2-VL backbone with QLoRA (407 lines)
-│   ├── action_decoder.py            # JSON action parser & validator (206 lines)
-│   ├── prompt_builder.py            # Multimodal prompt construction (237 lines)
-│   └── uncertainty.py               # Token-level confidence estimation (196 lines)
+├── models/                       # MODEL LAYER
+│   ├── vla_model.py              #   Qwen2-VL backbone + QLoRA
+│   ├── action_decoder.py         #   JSON action parsing & validation
+│   ├── prompt_builder.py         #   Multimodal prompt construction
+│   └── uncertainty.py            #   Token-level confidence estimation
 │
-├── data/                            # 📦 Data pipeline
-│   ├── mind2web_loader.py           # HuggingFace dataset loading & processing (493 lines)
-│   ├── preprocessing.py             # DOM parsing & screenshot processing (274 lines)
-│   ├── augmentation.py              # Domain perturbation & visual augmentation (277 lines)
-│   └── precompute_embeddings.py     # Offline embedding cache for CPU efficiency
+├── data/                         # DATA PIPELINE
+│   ├── mind2web_loader.py        #   HuggingFace dataset loading
+│   ├── preprocessing.py          #   DOM parsing & screenshot processing
+│   ├── augmentation.py           #   Domain perturbation & augmentation
+│   └── precompute_embeddings.py  #   Offline embedding cache
 │
-├── environment/                     # 🌐 Browser interface
-│   ├── playwright_env.py            # Gym-like Playwright environment (613 lines)
-│   └── dom_serializer.py            # Structured DOM → token serialization (411 lines)
+├── environment/                  # BROWSER INTERFACE
+│   ├── playwright_env.py         #   Gym-like Playwright environment
+│   └── dom_serializer.py         #   Structured DOM tokenization
 │
-├── training/                        # 🏋️ Training pipeline
-│   └── train_supervised.py          # Multi-stage imitation learning (536 lines)
+├── training/                     # TRAINING
+│   └── train_supervised.py       #   Multi-stage imitation learning
 │
-├── evaluation/                      # 📊 Evaluation metrics
-│   └── evaluate.py                  # Comprehensive evaluation suite (359 lines)
+├── evaluation/                   # EVALUATION
+│   └── evaluate.py               #   Metrics & reporting
 │
-├── inference/                       # 🚀 Inference engine
-│   └── run_agent.py                 # End-to-end autonomous agent loop (330 lines)
+├── inference/                    # INFERENCE
+│   └── run_agent.py              #   End-to-end agent loop
 │
-├── memory/                          # 🛡️ Safety & memory
-│   └── failure_detector.py          # Loop/stale/error detection (169 lines)
+├── memory/                       # SAFETY
+│   └── failure_detector.py       #   Loop/stale/error detection
 │
-├── utils/                           # 🔧 Utilities
-│   ├── config.py                    # Dataclass-based configuration system (144 lines)
-│   └── logging.py                   # Structured JSON logging + profiling (127 lines)
+├── utils/                        # UTILITIES
+│   ├── config.py                 #   Dataclass config system
+│   └── logging.py                #   Structured JSON logging
 │
-└── tests/                           # ✅ Test suite
-    └── test_smoke.py                # Smoke tests for all modules
+└── tests/
+    └── test_smoke.py             #   Smoke tests
 ```
 
 ---
 
-## Components
+## Component Details
 
-### 1. Model Layer
+### 1. Model Layer — `models/`
 
-#### `VLAModel` — *models/vla_model.py*
+#### VLAModel (`vla_model.py`)
 
-The core multimodal model wrapping **Qwen2-VL-2B-Instruct** with QLoRA fine-tuning.
+The multimodal backbone. Wraps Qwen2-VL with quantization and LoRA adapters.
 
-| Method | Purpose |
-|--------|---------|
-| `load()` | Load base model with 4-bit quantization via `bitsandbytes` |
-| `apply_lora()` | Attach LoRA adapters to language + vision-language merger layers |
-| `generate()` | Autoregressive action generation with optional log-prob extraction |
-| `generate_with_beams()` | Multi-beam generation for uncertainty estimation |
-| `compute_loss()` | Token-level cross-entropy loss for training (with -100 masking) |
-| `save_lora()` / `load_lora()` | Checkpoint LoRA adapter weights |
+**Key methods:**
 
-**QLoRA Configuration:**
-- **Quantization**: 4-bit NF4 via `bitsandbytes`
-- **LoRA rank**: 16, alpha: 32, dropout: 0.05
-- **Target modules**: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`
+- `load()` — Load base model with 4-bit quantization
+- `apply_lora()` — Attach LoRA adapters to language + vision layers
+- `generate(messages, image)` — Generate an action with optional log-prob extraction
+- `generate_with_beams(messages, image, num_beams)` — Multi-beam generation for uncertainty
+- `compute_loss(input_ids, labels, pixel_values)` — Cross-entropy loss for training
+- `save_lora(path)` / `load_lora(path)` — Save and load LoRA weights
 
-#### `ActionDecoder` — *models/action_decoder.py*
+#### ActionDecoder (`action_decoder.py`)
 
-Robust JSON parser that handles real-world model outputs:
-- Clean JSON, markdown-fenced JSON, JSON embedded in explanation text
-- Action validation against valid DOM node IDs
-- Action normalization to canonical form
+Robust JSON parser for model outputs. Handles:
 
-#### `PromptBuilder` — *models/prompt_builder.py*
+- Clean JSON
+- JSON wrapped in markdown code fences
+- JSON embedded in explanatory text
+- Validation against valid DOM node IDs
+- Normalization to canonical action format
 
-Constructs multimodal chat-format prompts following the structure:
+#### PromptBuilder (`prompt_builder.py`)
+
+Constructs the multimodal input prompt:
 
 ```
 [SYSTEM]  → Agent role & available actions
-[IMAGE]   → Screenshot placeholder (filled by vision processor)
+[IMAGE]   → Screenshot (via vision processor)
 [TASK]    → User's natural language instruction
 [CONTEXT] → Current URL, page title
 [HISTORY] → Previous actions taken
-[DOM]     → Serialized DOM tokens (structured, up to 12K chars)
+[DOM]     → Serialized DOM tokens (up to 12K chars)
 [ACTION]  → "Generate the next action as JSON:"
 ```
 
-#### `TokenUncertainty` — *models/uncertainty.py*
+#### TokenUncertainty (`uncertainty.py`)
 
-Confidence estimation via two complementary signals:
+Two confidence signals:
 
-1. **Average Token Log Probability** — If avg log-prob < threshold (default: -2.0), trigger regeneration
-2. **Beam Disagreement** — If < 50% of beams agree on action type + element, flag as uncertain
+1. **Token Log Probability** — Average log-prob of generated tokens. Below threshold (-2.0) → regenerate.
+2. **Beam Disagreement** — Check if beams agree on action type + element. Below 50% agreement → uncertain.
 
-The threshold can be calibrated on a validation set using percentile-based tuning.
-
----
-
-### 2. Data Pipeline
-
-#### `Mind2WebLoader` — *data/mind2web_loader.py*
-
-Loads the [osunlp/Multimodal-Mind2Web](https://huggingface.co/datasets/osunlp/Multimodal-Mind2Web) dataset from HuggingFace and produces structured training samples:
-
-```python
-@dataclass
-class Mind2WebSample:
-    sample_id: str          # Unique identifier
-    task: str               # "Find one-way flights from NYC to LA"
-    website: str            # "google.com/flights"
-    domain: str             # "Travel"
-    raw_html: str           # Full page HTML
-    serialized_dom: str     # Structured DOM tokens
-    screenshot: Image       # Page screenshot
-    action: dict            # {"action": "CLICK", "element_id": 32}
-    action_history: list    # Previous actions in trajectory
-    step_index: int         # Position in multi-step trajectory
-```
-
-Also supports grouping samples into **trajectories** (`Mind2WebTrajectory`) for multi-step training with action histories.
-
-#### `DOMProcessor` & `ScreenshotProcessor` — *data/preprocessing.py*
-
-- **DOMProcessor**: Parses raw HTML into `DOMElement` dataclasses with tag, text, attributes, bounding box, clickability heuristics, and tree depth
-- **ScreenshotProcessor**: Resizes and normalizes screenshots for the vision encoder
-- **`crop_element_from_screenshot()`**: Extracts visual patches for individual DOM elements
-
-#### Augmentation Pipeline — *data/augmentation.py*
-
-Four augmentation strategies for domain generalization:
-
-| Augmentation | What it does |
-|-------------|-------------|
-| **DOMPerturbation** | Randomly drops attributes (15%), removes nodes (5%), shuffles CSS classes (10%) |
-| **VisualAugmentation** | Color jitter, random crop (85-100%), Gaussian blur |
-| **TextMasking** | Replaces 30% of element text labels with `[MASK]` tokens |
-| **Consistency Loss** | Cosine similarity regularization between original and perturbed embeddings |
+Threshold is calibrated on a validation set using percentile-based tuning.
 
 ---
 
-### 3. Browser Environment
+### 2. Data Pipeline — `data/`
 
-#### `BrowserEnvironment` — *environment/playwright_env.py*
+#### Mind2WebLoader (`mind2web_loader.py`)
 
-A **gym-like interface** wrapping Playwright for real browser interaction:
+Loads the [Multimodal-Mind2Web](https://huggingface.co/datasets/osunlp/Multimodal-Mind2Web) dataset from HuggingFace.
+
+Each sample contains:
+
+- **Task** — Natural language instruction (e.g., "Find flights from NYC to LA")
+- **Website / Domain** — Source website and category
+- **Raw HTML** — Full page source
+- **Serialized DOM** — Structured token representation
+- **Screenshot** — Page screenshot as PIL Image
+- **Action** — Ground-truth action JSON
+- **Action History** — Previous steps in the trajectory
+
+Supports both **single-step samples** and **full trajectories** (multi-step).
+
+#### Preprocessing (`preprocessing.py`)
+
+- `DOMProcessor` — Parses HTML into structured `DOMElement` objects with bounding boxes, clickability heuristics, tree depth
+- `ScreenshotProcessor` — Resize and normalize screenshots
+- `crop_element_from_screenshot()` — Extract visual patches per element
+
+#### Augmentation (`augmentation.py`)
+
+Four strategies for domain generalization:
+
+| Strategy | What It Does |
+|----------|-------------|
+| **DOM Perturbation** | Drop attributes (15%), remove nodes (5%), shuffle CSS classes (10%) |
+| **Visual Augmentation** | Color jitter, random crop (85-100%), Gaussian blur |
+| **Text Masking** | Replace 30% of element text with `[MASK]` tokens |
+| **Consistency Loss** | Cosine similarity regularization between original & perturbed embeddings |
+
+---
+
+### 3. Browser Environment — `environment/`
+
+#### BrowserEnvironment (`playwright_env.py`)
+
+Gym-like interface wrapping Playwright:
 
 ```python
-env = BrowserEnvironment(headless=True, viewport_width=1280, viewport_height=720)
+env = BrowserEnvironment(headless=True)
 await env.start()
 
 state = await env.reset(url="https://example.com")
-# state.screenshot → PIL Image
-# state.serialized_dom → structured DOM tokens
-# state.action_history → previous actions
+# state.screenshot      → PIL Image
+# state.serialized_dom  → structured DOM text
+# state.action_history  → list of previous actions
 
 new_state = await env.step(WebAction(action="CLICK", element_id=32))
 ```
 
-**Key capabilities:**
-- Full state extraction: DOM tree, screenshot, viewport info, page title/URL
-- Action execution: click, type, select, scroll (with error handling)
-- Bounding box extraction via JavaScript evaluation
-- **Mock mode** for testing without a real browser
+Features:
+- Full state extraction (DOM, screenshot, viewport info, URL, title)
+- Action execution with error handling (click, type, select, scroll)
+- Bounding box extraction via JavaScript
+- Mock mode for testing without a browser
 
-#### `DOMSerializer` — *environment/dom_serializer.py*
+#### DOMSerializer (`dom_serializer.py`)
 
-Converts raw DOM trees into structured token format optimized for the transformer:
+Converts raw DOM into structured tokens:
 
 ```
 <node id=32 tag=button depth=3 bbox=(0.125,0.278,0.234,0.056)>
@@ -365,96 +270,79 @@ Converts raw DOM trees into structured token format optimized for the transforme
 </node>
 ```
 
-**Features:**
+Key features:
 - Normalized bounding boxes (0–1 relative to viewport)
 - Interactability detection (buttons, inputs, links, ARIA roles)
 - Viewport-proximity sorting (visible elements first)
-- Deterministic truncation (max 500 nodes)
-- Non-visual tag filtering (script, style, meta, etc.)
+- Max 500 nodes, deterministic truncation
 
 ---
 
-### 4. Training Pipeline
+### 4. Training Pipeline — `training/`
 
-#### `VLATrainer` — *training/train_supervised.py*
+#### VLATrainer (`train_supervised.py`)
 
-Multi-stage imitation learning trainer:
+Multi-stage imitation learning:
 
-##### Stage 1: Single-Step Imitation
-```
-Input:  task + DOM + screenshot + empty history
-Target: ground-truth action JSON
-Loss:   token-level cross-entropy
-```
-Each sample is an independent (state, action) pair. The model learns to ground elements and predict individual actions.
+**Stage 1 — Single-Step Imitation** (5 epochs)
+- Input: task + DOM + screenshot + empty history
+- Target: ground-truth action JSON
+- Each sample is an independent (state, action) pair
 
-##### Stage 2: Multi-Step Imitation (Teacher Forcing)
-```
-Input:  task + DOM + screenshot + ground-truth action history
-Target: next action JSON
-Loss:   token-level cross-entropy
-```
-Trains on full trajectories. Each step includes the ground-truth action history from prior steps, teaching the model to leverage context.
+**Stage 2 — Multi-Step Imitation** (10 epochs)
+- Input: task + DOM + screenshot + ground-truth history
+- Target: next action JSON
+- Trains on full trajectories with teacher forcing
 
-##### Stage 3: RL Fine-Tuning *(optional, configured but not yet active)*
+**Stage 3 — RL Fine-Tuning** (optional, not active by default)
 
-**Training Details:**
-- **Optimizer**: AdamW (lr: 2e-4, weight decay: 0.01)
-- **Schedule**: Linear warmup (10% of steps) + linear decay
-- **Precision**: BF16 mixed precision
-- **Gradient clipping**: Max norm 1.0
-- **Gradient accumulation**: 4 steps (effective batch size: 16)
+Training hyperparameters:
+
+| Parameter | Value |
+|-----------|-------|
+| Optimizer | AdamW |
+| Learning rate | 2e-4 |
+| Weight decay | 0.01 |
+| Warmup | 10% of steps |
+| Precision | BF16 |
+| Gradient clipping | Max norm 1.0 |
+| Gradient accumulation | 4 steps |
+| Effective batch size | 16 |
 
 ---
 
-### 5. Evaluation
+### 5. Evaluation — `evaluation/`
 
-#### `VLAEvaluator` — *evaluation/evaluate.py*
+#### VLAEvaluator (`evaluate.py`)
 
-Comprehensive evaluation across Mind2Web's three test splits:
+Evaluates across three Mind2Web test splits:
 
-| Split | Tests |
-|-------|-------|
+| Split | What It Tests |
+|-------|---------------|
 | `test_task` | New tasks on seen websites |
 | `test_website` | New websites in seen domains |
 | `test_domain` | Entirely new domains |
 
-**Metrics computed:**
+Metrics computed:
 
 | Metric | Description |
 |--------|-------------|
 | Element Accuracy | Correct target element grounding |
 | Action Accuracy | Correct action type prediction |
-| Full Match Accuracy | Exact match (action + element + value) |
-| Per-Action F1 | Precision/recall/F1 per action type (CLICK, TYPE, SELECT, SCROLL) |
-| Parse Success Rate | Fraction of outputs that parse as valid JSON |
+| Full Match | Exact match (action + element + value) |
+| Per-Action F1 | Precision/recall/F1 per action type |
+| Parse Success Rate | Valid JSON output fraction |
 | Mean Latency | Average inference time per step |
 | Failure Breakdown | Distribution of error types |
 
 ---
 
-### 6. Inference Engine
+### 6. Inference Engine — `inference/`
 
-#### `VLAAgent` — *inference/run_agent.py*
+#### VLAAgent (`run_agent.py`)
 
-The end-to-end autonomous agent that ties everything together:
+End-to-end autonomous agent. The execution loop:
 
-```python
-agent = VLAAgent(device="cuda")
-agent.load_model(checkpoint="checkpoints/stage2_best")
-
-result = await agent.run_task(
-    url="https://www.google.com/flights",
-    task="Book a one-way flight from NYC to LA for next Friday",
-    max_steps=30,
-)
-
-print(result["success"])       # True/False
-print(result["total_steps"])   # Number of actions taken
-print(result["steps"])         # Detailed step-by-step log
-```
-
-**Agent Loop:**
 1. Extract browser state (DOM + screenshot)
 2. Build multimodal prompt
 3. Generate action via Qwen2-VL
@@ -462,111 +350,85 @@ print(result["steps"])         # Detailed step-by-step log
 5. If uncertain → regenerate (up to 2 retries)
 6. Parse & validate JSON action
 7. Execute action in browser
-8. Check for failure patterns (stale/loop/error)
-9. Repeat until `DONE` or max steps reached
+8. Check for failures (stale state, loops, errors)
+9. Repeat until DONE or max steps
 
 ---
 
-### 7. Memory & Safety
+### 7. Safety — `memory/`
 
-#### `FailureDetector` — *memory/failure_detector.py*
+#### FailureDetector (`failure_detector.py`)
 
-Heuristic failure detection that monitors the agent's behavior:
+Monitors the agent for failure patterns:
 
-| Failure Type | Detection Method |
-|-------------|-----------------|
-| **Stale State** | 3+ consecutive unchanged page states (by MD5 hash) |
-| **Error Page** | Title/URL contains 404, 500, "not found", "forbidden", etc. |
-| **Action Loop** | Repeating action pattern within a sliding window of 4 |
-| **Timeout** | Total steps exceed `max_steps` (default: 30) |
+| Failure Type | How It's Detected |
+|-------------|-------------------|
+| Stale State | 3+ consecutive unchanged page states |
+| Error Page | Title/URL contains 404, 500, "not found", etc. |
+| Action Loop | Repeating action pattern in sliding window of 4 |
+| Timeout | Total steps exceed max (default: 30) |
 
 ---
 
-### 8. Utilities
+### 8. Utilities — `utils/`
 
-#### Configuration System — *utils/config.py*
+**Config** (`config.py`) — Hierarchical dataclass configuration with YAML overlay. Groups: Model, Training, Data, Environment, Uncertainty, Evaluation, Logging.
 
-Hierarchical dataclass-based configuration with YAML overlay:
-
-```python
-from utils.config import load_config
-
-cfg = load_config("configs/default.yaml")
-print(cfg.model.name)              # "Qwen/Qwen2-VL-2B-Instruct"
-print(cfg.training.learning_rate)  # 2e-4
-print(cfg.environment.headless)    # True
-```
-
-Configuration groups: `ModelConfig`, `TrainingConfig`, `DataConfig`, `EnvironmentConfig`, `UncertaintyConfig`, `EvaluationConfig`, `LoggingConfig`.
-
-#### Logging — *utils/logging.py*
-
-- **Console**: Human-readable format with timestamps
-- **File**: JSON Lines (`.jsonl`) with structured metric logging
-- **Profiling**: `@timed` decorator and `timer()` context manager
+**Logging** (`logging.py`) — Console (human-readable) + file (JSON Lines) handlers, structured metric logging, `@timed` decorator and `timer()` context manager for profiling.
 
 ---
 
 ## Installation
 
-### Prerequisites
-
+**Prerequisites:**
 - Python 3.10+
-- CUDA-capable GPU (4-bit quantization requires NVIDIA GPU)
-- ~10GB VRAM minimum (Qwen2-VL-2B with QLoRA)
-
-### Install
+- CUDA GPU (~10GB VRAM for QLoRA)
 
 ```bash
-# Clone the repository
+# Clone
 git clone https://github.com/simran-kalkeri/web-vla-agent.git
-cd web-vla-agent
+cd web-vla-agent/web_vla_agent
 
-# Install the package
-cd web_vla_agent
+# Install
 pip install -e .
 
-# Install Playwright browsers
+# Install browser
 playwright install chromium
 
-# (Optional) Install dev dependencies
+# (Optional) Dev dependencies
 pip install -e ".[dev]"
 ```
 
 ---
 
-## Quick Start
+## Usage
 
-### 1. Run the Agent (Inference)
-
-```bash
-cd web_vla_agent
-python -m inference.run_agent \
-    --url "https://www.example.com" \
-    --task "Find the contact page and get the email address" \
-    --checkpoint checkpoints/stage2_best
-```
-
-### 2. Train the Model
+### Train
 
 ```bash
-cd web_vla_agent
 python -m training.train_supervised
 ```
 
-### 3. Evaluate
+### Evaluate
 
 ```bash
-cd web_vla_agent
 python -m evaluation.evaluate \
     --checkpoint checkpoints/stage2_best \
     --splits test_task test_website test_domain
 ```
 
-### 4. Run Tests
+### Run the Agent
 
 ```bash
-cd web_vla_agent
+python -m inference.run_agent \
+    --url "https://www.example.com" \
+    --task "Find the contact page" \
+    --checkpoint checkpoints/stage2_best
+```
+
+### Run Tests
+
+```bash
 pytest tests/ -v
 ```
 
@@ -574,7 +436,13 @@ pytest tests/ -v
 
 ## Configuration
 
-The full configuration is in `configs/default.yaml`:
+All settings live in `configs/default.yaml`. Override with:
+
+```bash
+export VLA_CONFIG=/path/to/custom.yaml
+```
+
+Key sections:
 
 ```yaml
 model:
@@ -582,11 +450,10 @@ model:
   use_qlora: true
   lora_r: 16
   quantization_bits: 4
-  action_types: ["CLICK", "TYPE", "SELECT", "SCROLL"]
 
 training:
-  stage1_epochs: 5          # Single-step imitation
-  stage2_epochs: 10         # Multi-step with teacher forcing
+  stage1_epochs: 5
+  stage2_epochs: 10
   learning_rate: 2.0e-4
   batch_size: 4
   bf16: true
@@ -604,126 +471,85 @@ environment:
 uncertainty:
   min_log_prob_threshold: -2.0
   beam_width: 3
-  max_regenerations: 2
-```
-
-Override via environment variable:
-```bash
-export VLA_CONFIG=/path/to/custom_config.yaml
 ```
 
 ---
 
 ## Training Guide
 
-### Data Preparation
+### Data
 
-The training pipeline automatically downloads from HuggingFace:
+The pipeline downloads automatically from HuggingFace:
 
 ```python
 from data.mind2web_loader import Mind2WebLoader
 
-loader = Mind2WebLoader(dataset_name="osunlp/Multimodal-Mind2Web")
-
-# Single-step samples
-train_samples = loader.build_training_examples(split="train")
-
-# Multi-step trajectories
-trajectories = loader.build_trajectories(split="train")
+loader = Mind2WebLoader()
+train_samples = loader.build_training_examples(split="train")      # single-step
+trajectories  = loader.build_trajectories(split="train")           # multi-step
 ```
 
 ### Training Stages
 
-```mermaid
-graph LR
-    A["Stage 1<br/>Single-Step<br/>5 epochs"] --> B["Stage 2<br/>Multi-Step<br/>10 epochs"]
-    B --> C["Stage 3<br/>RL Fine-Tune<br/>(optional)"]
-
-    style A fill:#1a1b27,stroke:#58a6ff,color:#fff
-    style B fill:#1a1b27,stroke:#3fb950,color:#fff
-    style C fill:#1a1b27,stroke:#d29922,color:#fff
+```
+Stage 1 (5 epochs)          Stage 2 (10 epochs)         Stage 3 (optional)
+Single-step imitation  ───▶  Multi-step w/ history  ───▶  RL fine-tuning
+Learn individual actions     Learn sequential decisions   Online improvement
 ```
 
 ### GPU Requirements
 
-| Setup | VRAM | Notes |
-|-------|------|-------|
-| QLoRA 4-bit (Qwen2-VL-2B) | ~10GB | Default — works on RTX 3080/4070 |
-| Full fine-tune (Qwen2-VL-2B) | ~20GB | Requires A100/A6000 |
-| Batch size 4 + grad accum 4 | ~12GB | Effective batch size: 16 |
+| Setup | VRAM Needed |
+|-------|-------------|
+| QLoRA 4-bit (default) | ~10 GB |
+| Full fine-tune | ~20 GB |
+| Batch 4 + grad accum 4 | ~12 GB |
 
 ---
 
-## Evaluation Guide
-
-### Running Evaluation
-
-```python
-from evaluation.evaluate import VLAEvaluator
-
-evaluator = VLAEvaluator()
-
-# Evaluate step-by-step
-result = evaluator.evaluate_step(
-    predicted={"action": "CLICK", "element_id": 32},
-    ground_truth={"action": "CLICK", "element_id": 32},
-)
-
-# Compute all metrics
-metrics = evaluator.compute_metrics()
-evaluator.print_report(metrics)
-```
+## Evaluation
 
 ### Target Metrics
 
-| Metric | Target | Description |
-|--------|--------|-------------|
-| Element Accuracy | 35–45% | Correct element grounding |
-| Recall@5 | ≥ 60% | Target in top-5 predictions |
-| Action Accuracy | ≥ 70% | Correct action type |
-| Macro F1 | ≥ 0.6 | Balanced across action types |
+| Metric | Target |
+|--------|--------|
+| Element Accuracy | 35–45% |
+| Recall@5 | ≥ 60% |
+| Action Accuracy | ≥ 70% |
+| Macro F1 | ≥ 0.6 |
 
 ---
 
 ## Action Space
 
-The agent outputs structured JSON actions:
-
-| Action | Format | Example |
-|--------|--------|---------|
-| **CLICK** | `{"action": "CLICK", "element_id": <id>}` | Click "Submit" button |
-| **TYPE** | `{"action": "TYPE", "element_id": <id>, "value": "<text>"}` | Type "Brooklyn" in search box |
-| **SELECT** | `{"action": "SELECT", "element_id": <id>, "value": "<option>"}` | Select "Economy" from dropdown |
-| **SCROLL** | `{"action": "SCROLL", "direction": "<up\|down>", "amount": <px>}` | Scroll down 300px |
-| **DONE** | `{"action": "DONE"}` | Task completed |
+| Action | JSON Format | Description |
+|--------|------------|-------------|
+| CLICK | `{"action": "CLICK", "element_id": 32}` | Click on element |
+| TYPE | `{"action": "TYPE", "element_id": 15, "value": "Brooklyn"}` | Type text into field |
+| SELECT | `{"action": "SELECT", "element_id": 8, "value": "Economy"}` | Select dropdown option |
+| SCROLL | `{"action": "SCROLL", "direction": "down", "amount": 300}` | Scroll the page |
+| DONE | `{"action": "DONE"}` | Task complete |
 
 ---
 
-## Research Contributions
+## Research Highlights
 
-This project addresses several key challenges in web agent research:
+1. **End-to-End Multimodal Grounding** — Joint element grounding and action generation in a single autoregressive pass, unlike pipeline approaches that separate ranking from prediction.
 
-1. **End-to-End Multimodal Grounding** — Unlike pipeline approaches that separate element ranking from action prediction, our model jointly grounds elements and generates actions through a single autoregressive pass.
+2. **Structured DOM Tokenization** — Per-node tokens with normalized bounding boxes and viewport metadata, giving geometric and structural signals instead of flat HTML.
 
-2. **Structured DOM Tokenization** — Instead of flat HTML, we serialize DOM nodes with normalized bounding boxes and viewport metadata, giving the model geometric and structural signals.
+3. **Token-Level Uncertainty** — Generative log probabilities + beam disagreement for confidence-aware action selection, with validation-set calibration.
 
-3. **Token-Level Uncertainty** — Rather than classification-based confidence, we use generative token log probabilities and beam disagreement to assess action confidence.
+4. **Domain Perturbation** — DOM augmentation + visual augmentation + text masking + contrastive consistency loss for robust cross-domain transfer.
 
-4. **Domain Perturbation** — DOM augmentation (attribute dropping, class shuffling, node removal) + visual augmentation + text masking + contrastive consistency loss for cross-domain robustness.
-
-5. **Multi-Stage Training** — Progressive curriculum: learn single actions first, then learn to use action history for sequential decision-making.
+5. **Multi-Stage Curriculum** — Progressive training: single actions first, then sequential decision-making with action histories.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-<div align="center">
-
-*Built with 🔥 PyTorch, 🤗 Transformers, and 🎭 Playwright*
-
-</div>
-]]>
+*Built with PyTorch, HuggingFace Transformers, and Playwright*
