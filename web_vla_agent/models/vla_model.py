@@ -407,6 +407,9 @@ class VLAModel:
             print("Max input_id:", max_id)
             print("Negative ID count:", neg_count)
             print("Out-of-bounds count:", oob_count)
+            print("ATTN MASK MIN:", int(attention_mask.min()))
+print("ATTN MASK MAX:", int(attention_mask.max()))
+print("ATTN MASK DTYPE:", attention_mask.dtype)
             print("=======================================")
             self._ids_debug_printed = True
 
