@@ -110,6 +110,21 @@ class VLAModel:
         )
         self.tokenizer = self.processor.tokenizer
 
+        # Resize the embedding table to match the tokenizer vocabulary.
+        # Qwen2-VL config.vocab_size (151936) does NOT include vision special
+        # tokens that the tokenizer can produce (e.g. <|image_pad|> at 151655,
+        # and others up to 152064). Any token ID outside the embedding table
+        # causes a CUDA vectorized_gather_kernel assertion failure.
+        actual_emb_size = self.model.get_input_embeddings().weight.shape[0]
+        tokenizer_size = len(self.tokenizer)
+        if tokenizer_size != actual_emb_size:
+            logger.info(
+                f"Resizing token embeddings: {actual_emb_size} -> {tokenizer_size}"
+            )
+            self.model.resize_token_embeddings(tokenizer_size)
+        else:
+            logger.info(f"Token embeddings already correct size: {actual_emb_size}")
+
         self._is_loaded = True
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -367,6 +382,18 @@ class VLAModel:
         """
         if not self._is_loaded:
             self.load()
+
+        # One-time diagnostic: confirm embedding table covers all input_ids.
+        # Logs on the very first batch so you can verify the vocab-resize fix.
+        if not getattr(self, "_ids_validated", False):
+            emb_size = self.model.get_input_embeddings().weight.shape[0]
+            max_id = int(input_ids.max())
+            bad_count = int((input_ids >= emb_size).sum())
+            logger.info(
+                f"[vocab check] embedding_size={emb_size}, "
+                f"max_input_id={max_id}, out_of_bounds={bad_count}"
+            )
+            self._ids_validated = True
 
         kwargs: Dict[str, Any] = {
             "input_ids": input_ids.to(self.model.device),
