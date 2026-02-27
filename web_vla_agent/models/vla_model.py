@@ -135,24 +135,38 @@ class VLAModel:
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         if self.load_in_4bit:
-            self.model = prepare_model_for_kbit_training(self.model)
+            # use_reentrant=False is required to avoid a hard error in PyTorch >=2.9
+            # and suppresses the "use_reentrant parameter should be passed explicitly"
+            # warning already visible in training logs.
+            self.model = prepare_model_for_kbit_training(
+                self.model,
+                use_gradient_checkpointing=True,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
 
         # Build target modules list — include vision merger layers
         target_modules = list(self.config.model.lora_target_modules)
 
-        # Discover cross-attention / merger modules in the model
-        vision_targets = []
+        # Discover cross-attention / merger modules in the model.
+        # Only collect known-safe leaf names to avoid accidentally targeting
+        # unrelated modules that share a generic name like 'fc1' or 'mlp'.
+        _VISION_LEAF_NAMES = frozenset({"fc1", "fc2", "mlp", "q_proj", "k_proj", "v_proj", "o_proj"})
+        vision_targets = set()
         for name, _ in self.model.named_modules():
             # Qwen2-VL uses 'visual.merger' for vision-language bridge
-            if 'merger' in name and any(proj in name for proj in ['fc1', 'fc2', 'mlp']):
-                vision_targets.append(name.split('.')[-1])
+            if "merger" in name:
+                leaf = name.split(".")[-1]
+                if leaf in _VISION_LEAF_NAMES:
+                    vision_targets.add(leaf)
             # Also catch cross-attention projections
-            if 'cross_attn' in name and any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
-                vision_targets.append(name.split('.')[-1])
+            if "cross_attn" in name:
+                leaf = name.split(".")[-1]
+                if leaf in _VISION_LEAF_NAMES:
+                    vision_targets.add(leaf)
 
-        # Deduplicate and merge
-        all_targets = list(set(target_modules + vision_targets))
-        logger.info(f"LoRA target modules: {all_targets}")
+        # Merge with language model targets and deduplicate
+        all_targets = list(set(target_modules) | vision_targets)
+        logger.info(f"LoRA target modules: {sorted(all_targets)}")
 
         lora_config = LoraConfig(
             r=self.config.model.lora_r,
