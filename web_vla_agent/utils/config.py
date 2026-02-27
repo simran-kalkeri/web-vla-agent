@@ -33,6 +33,9 @@ class ModelConfig:
     action_types: List[str] = field(
         default_factory=lambda: ["CLICK", "TYPE", "SELECT", "SCROLL"]
     )
+    # Image resolution limits for Qwen2-VL processor
+    image_min_pixels: int = 256 * 28 * 28    # 200704
+    image_max_pixels: int = 1280 * 28 * 28   # 1003520
 
 
 @dataclass

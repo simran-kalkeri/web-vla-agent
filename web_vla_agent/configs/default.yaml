@@ -18,6 +18,10 @@ model:
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
   quantization_bits: 4
 
+  # Image resolution limits for Qwen2-VL processor
+  image_min_pixels: 200704     # 256 * 28 * 28
+  image_max_pixels: 1003520    # 1280 * 28 * 28
+
   # Action types
   action_types: ["CLICK", "TYPE", "SELECT", "SCROLL"]
 
@@ -31,8 +35,8 @@ training:
 
   learning_rate: 2.0e-4
   weight_decay: 0.01
-  batch_size: 2
-  gradient_accumulation_steps: 4
+  batch_size: 1
+  gradient_accumulation_steps: 8
   warmup_ratio: 0.1
   max_grad_norm: 1.0
   seed: 42

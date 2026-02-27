@@ -350,28 +350,41 @@ class Mind2WebLoader:
         return ""
 
     def _extract_screenshot(self, raw_sample: Dict[str, Any]) -> Optional[Image.Image]:
-        """Extract screenshot from the dataset sample."""
+        """
+        Extract screenshot from the dataset sample.
+
+        Always returns an RGB PIL Image. If the sample has no screenshot,
+        returns a white placeholder (224x224) so every training sample
+        is multimodal and the vision pipeline stays active.
+        """
         screenshot = raw_sample.get("screenshot")
-        if screenshot is None:
-            return None
+        img = None
 
         # If it's already a PIL Image
         if isinstance(screenshot, Image.Image):
-            return screenshot
+            img = screenshot
 
         # If it's bytes
-        if isinstance(screenshot, bytes):
+        elif isinstance(screenshot, bytes):
             from io import BytesIO
             try:
-                return Image.open(BytesIO(screenshot))
+                img = Image.open(BytesIO(screenshot))
             except Exception:
-                return None
+                img = None
 
         # If it's a path string
-        if isinstance(screenshot, str):
+        elif isinstance(screenshot, str):
             try:
-                return Image.open(screenshot)
+                img = Image.open(screenshot)
             except Exception:
-                return None
+                img = None
 
-        return None
+        # Fallback: white placeholder so every sample is multimodal
+        if img is None:
+            img = Image.new("RGB", (224, 224), (255, 255, 255))
+
+        # Ensure RGB (Qwen2-VL image processor requires 3-channel input)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        return img

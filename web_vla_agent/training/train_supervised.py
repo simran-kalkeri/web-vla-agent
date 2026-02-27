@@ -1,5 +1,5 @@
 """
-Supervised Training — Multi-Stage Imitation Learning.
+Supervised Training — Multi-Stage Imitation Learning (Multimodal).
 
 Stage 1: Single-step imitation
   Input: task + DOM + screenshot + empty history
@@ -18,11 +18,14 @@ NOT:
   - InfoNCE contrastive loss
   - Focal loss on action classes
   - GCN/grounder training
+
+Data flow:
+  Mind2WebSample → PromptBuilder.build_training_messages()
+  → processor.apply_chat_template() → processor(text, images)
+  → {input_ids, attention_mask, pixel_values, image_grid_thw, labels}
+  → model.compute_loss()
 """
 from __future__ import annotations
-
-import os
-os.environ["PYTORCH_SDP_DISABLE"] = "1"
 
 import json
 import logging
@@ -55,17 +58,13 @@ class Mind2WebVLADataset(Dataset):
     """
     PyTorch Dataset wrapping Mind2Web samples for VLA training.
 
-    Each sample is a dict with pre-built prompt + target text.
+    Each sample is a Mind2WebSample with .task, .serialized_dom,
+    .action, .action_history, .screenshot, .website fields.
     Tokenization happens in the collator.
     """
 
-    def __init__(
-        self,
-        samples: list,
-        prompt_builder=None,
-    ):
+    def __init__(self, samples: list):
         self.samples = samples
-        self.prompt_builder = prompt_builder
 
     def __len__(self):
         return len(self.samples)
@@ -74,102 +73,139 @@ class Mind2WebVLADataset(Dataset):
         return self.samples[idx]
 
 
-# ── Simple collate function ──────────────────────────────────
+# ── Multimodal collate function ──────────────────────────────
 
-def collate_fn(batch, tokenizer, prompt_builder, max_seq_length=4096):
+def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048):
     """
-    Collate Mind2WebSamples into a training batch.
+    Collate Mind2WebSamples into a multimodal training batch.
 
-    Builds prompt + target, tokenizes full text once,
-    and masks prompt tokens in labels with -100.
+    For each sample:
+    1. Build Qwen2-VL chat messages (system + user[image+text] + assistant[action])
+    2. Render via processor.apply_chat_template()
+    3. Process with processor() to get input_ids + pixel_values + image_grid_thw
+    4. Compute prompt-only length and mask prompt tokens with -100 in labels
+
+    Returns dict with:
+      - input_ids: [batch, seq_len]
+      - attention_mask: [batch, seq_len]
+      - labels: [batch, seq_len]  (prompt tokens = -100)
+      - pixel_values: [total_patches, channels] or None
+      - image_grid_thw: [num_images, 3] or None
     """
+    from qwen_vl_utils import process_vision_info
 
-    batch_input_ids = []
-    batch_labels = []
-    batch_attention_mask = []
+    all_input_ids = []
+    all_labels = []
+    all_attention_mask = []
+    all_pixel_values = []
+    all_image_grid_thw = []
 
     for sample in batch:
-        # Build training prompt + target
-        training = prompt_builder.build_training_prompt(
+        # 1. Build multimodal chat messages with target
+        training_data = prompt_builder.build_training_messages(
             task=sample.task,
             serialized_dom=sample.serialized_dom,
             target_action=sample.action,
+            screenshot=sample.screenshot,
             action_history=sample.action_history,
             extra_context=f"Website: {sample.website}" if sample.website else "",
         )
 
-        prompt_text = training["prompt"]
-        target_text = "\n" + training["target"]
+        messages_full = training_data["messages_with_target"]
+        messages_prompt = training_data["messages_prompt_only"]
 
-        # Combine full training text
-        full_text = prompt_text + target_text
+        # 2. Render full conversation text (with assistant response)
+        full_text = processor.apply_chat_template(
+            messages_full,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
 
-        # Tokenize full sequence once
-        tokens = tokenizer(
-            full_text,
+        # 3. Render prompt-only text (for computing prompt length)
+        prompt_text = processor.apply_chat_template(
+            messages_prompt,
+            tokenize=False,
+            add_generation_prompt=True,  # adds the assistant prefix
+        )
+
+        # 4. Extract vision info from messages
+        image_inputs, video_inputs = process_vision_info(messages_full)
+
+        # 5. Process full text + images → input_ids, pixel_values, etc.
+        full_inputs = processor(
+            text=[full_text],
+            images=image_inputs if image_inputs else None,
+            videos=video_inputs if video_inputs else None,
+            padding=False,
+            truncation=True,
+            max_length=max_seq_length,
             return_tensors="pt",
-            truncation=True,
-            max_length=max_seq_length,
-            add_special_tokens=True,
         )
 
-        input_ids = tokens["input_ids"][0]
-        attention_mask = tokens["attention_mask"][0]
+        input_ids = full_inputs["input_ids"][0]
+        attention_mask = full_inputs["attention_mask"][0]
 
-        # Determine prompt length (for masking)
-        prompt_tokens = tokenizer(
-            prompt_text,
+        # 6. Process prompt-only text to get prompt token count
+        prompt_inputs = processor(
+            text=[prompt_text],
+            images=image_inputs if image_inputs else None,
+            videos=video_inputs if video_inputs else None,
+            padding=False,
             truncation=True,
             max_length=max_seq_length,
-            add_special_tokens=True,
+            return_tensors="pt",
         )
-        prompt_len = len(prompt_tokens["input_ids"])
+        prompt_len = prompt_inputs["input_ids"].shape[1]
 
-        # Build labels
+        # 7. Build labels: mask prompt tokens with -100
         labels = input_ids.clone()
-        labels[:prompt_len] = -100  # mask prompt tokens
+        labels[:prompt_len] = -100
 
-        batch_input_ids.append(input_ids)
-        batch_labels.append(labels)
-        batch_attention_mask.append(attention_mask)
+        all_input_ids.append(input_ids)
+        all_labels.append(labels)
+        all_attention_mask.append(attention_mask)
 
-    # Pad to max length in batch
-    max_len = max(ids.shape[0] for ids in batch_input_ids)
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+        # Collect pixel values and grid info
+        if "pixel_values" in full_inputs:
+            all_pixel_values.append(full_inputs["pixel_values"])
+        if "image_grid_thw" in full_inputs:
+            all_image_grid_thw.append(full_inputs["image_grid_thw"])
+
+    # Pad text sequences to max length in batch
+    max_len = max(ids.shape[0] for ids in all_input_ids)
+    pad_token_id = processor.tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = processor.tokenizer.eos_token_id or 0
 
     padded_ids = []
     padded_labels = []
     padded_masks = []
 
-    for ids, lbls, mask in zip(batch_input_ids, batch_labels, batch_attention_mask):
+    for ids, lbls, mask in zip(all_input_ids, all_labels, all_attention_mask):
         pad_len = max_len - ids.shape[0]
-
         padded_ids.append(
-            torch.cat([
-                ids,
-                torch.full((pad_len,), pad_token_id, dtype=ids.dtype)
-            ])
+            torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
         )
-
         padded_labels.append(
-            torch.cat([
-                lbls,
-                torch.full((pad_len,), -100, dtype=lbls.dtype)
-            ])
+            torch.cat([lbls, torch.full((pad_len,), -100, dtype=lbls.dtype)])
         )
-
         padded_masks.append(
-            torch.cat([
-                mask,
-                torch.zeros(pad_len, dtype=mask.dtype)
-            ])
+            torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
         )
 
-    return {
+    result = {
         "input_ids": torch.stack(padded_ids),
         "attention_mask": torch.stack(padded_masks),
         "labels": torch.stack(padded_labels),
     }
+
+    # Concatenate pixel_values and image_grid_thw across all samples
+    if all_pixel_values:
+        result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
+    if all_image_grid_thw:
+        result["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+
+    return result
 
 
 # ── Trainer ──────────────────────────────────────────────────
@@ -206,7 +242,20 @@ class VLATrainer:
         self.model.load()
         self.model.apply_lora()
 
-        # Setup optimizer
+        # Configure processor image resolution limits
+        if hasattr(self.model.processor, "image_processor"):
+            self.model.processor.image_processor.min_pixels = (
+                self.config.model.image_min_pixels
+            )
+            self.model.processor.image_processor.max_pixels = (
+                self.config.model.image_max_pixels
+            )
+            logger.info(
+                f"Image processor: min_pixels={self.config.model.image_min_pixels}, "
+                f"max_pixels={self.config.model.image_max_pixels}"
+            )
+
+        # Setup optimizer — only LoRA parameters
         trainable_params = [p for p in self.model.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
             trainable_params,
@@ -216,6 +265,102 @@ class VLATrainer:
 
         logger.info("Training setup complete")
 
+    def _run_training_loop(
+        self,
+        dataloader: DataLoader,
+        num_epochs: int,
+        stage: int,
+        val_samples: Optional[list] = None,
+        prompt_builder=None,
+    ) -> Dict[str, Any]:
+        """
+        Shared training loop for Stage 1 and Stage 2.
+
+        Returns dict with metrics history.
+        """
+        self.model.model.train()
+        total_steps = 0
+        grad_accum = self.config.training.gradient_accumulation_steps
+        metrics_history = []
+
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            epoch_steps = 0
+            start_time = time.time()
+
+            for batch_idx, batch in enumerate(dataloader):
+                try:
+                    # Forward pass — pass all multimodal tensors
+                    loss = self.model.compute_loss(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                        pixel_values=batch.get("pixel_values"),
+                        image_grid_thw=batch.get("image_grid_thw"),
+                    )
+
+                    # Scale loss for gradient accumulation
+                    loss = loss / grad_accum
+                    loss.backward()
+
+                    if (batch_idx + 1) % grad_accum == 0:
+                        # Gradient clipping
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in self.model.model.parameters() if p.requires_grad],
+                            self.config.training.max_grad_norm,
+                        )
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                        total_steps += 1
+
+                    epoch_loss += loss.item() * grad_accum
+                    epoch_steps += 1
+
+                    if (batch_idx + 1) % self.config.training.logging_steps == 0:
+                        avg_loss = epoch_loss / epoch_steps
+                        logger.info(
+                            f"  Epoch {epoch+1} Step {batch_idx+1}/{len(dataloader)} "
+                            f"Loss={avg_loss:.4f}"
+                        )
+
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        logger.warning(
+                            f"OOM at batch {batch_idx+1}, skipping. "
+                            "Consider reducing max_seq_length or image_max_pixels."
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        self.optimizer.zero_grad()
+                        continue
+                    raise
+
+            epoch_time = time.time() - start_time
+            avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+            logger.info(
+                f"Epoch {epoch+1}/{num_epochs} "
+                f"Loss={avg_epoch_loss:.4f} Time={epoch_time:.1f}s"
+            )
+
+            metrics_history.append({
+                "epoch": epoch + 1,
+                "stage": stage,
+                "loss": avg_epoch_loss,
+                "time": epoch_time,
+            })
+
+            # Save checkpoint
+            if (epoch + 1) % self.config.training.save_every_n_epochs == 0:
+                self._save_checkpoint(f"stage{stage}_epoch{epoch+1}")
+
+            # Validation
+            if val_samples and prompt_builder:
+                val_metrics = self._validate(val_samples, prompt_builder)
+                metrics_history[-1].update(val_metrics)
+                logger.info(f"  Val: {val_metrics}")
+
+        return {"stage": stage, "metrics": metrics_history}
+
     def train_stage1(
         self,
         train_samples: list,
@@ -224,7 +369,7 @@ class VLATrainer:
         """
         Stage 1: Single-step imitation learning.
 
-        Each sample is an independent (state, action) pair.
+        Each sample is an independent (state, action) pair with screenshot.
         """
         logger.info(f"=== Stage 1: Single-Step Imitation ({self.config.training.stage1_epochs} epochs) ===")
         logger.info(f"Training samples: {len(train_samples)}")
@@ -232,13 +377,13 @@ class VLATrainer:
         from models.prompt_builder import PromptBuilder
         prompt_builder = PromptBuilder()
 
-        dataset = Mind2WebVLADataset(train_samples, prompt_builder)
+        dataset = Mind2WebVLADataset(train_samples)
 
-        # Create dataloader with custom collate
+        # Create dataloader with multimodal collate
         from functools import partial
         collate = partial(
-            collate_fn,
-            tokenizer=self.model.tokenizer,
+            multimodal_collate_fn,
+            processor=self.model.processor,
             prompt_builder=prompt_builder,
             max_seq_length=self.config.training.max_seq_length,
         )
@@ -252,74 +397,13 @@ class VLATrainer:
             drop_last=True,
         )
 
-        # Training loop
-        self.model.model.train()
-        total_steps = 0
-        grad_accum = self.config.training.gradient_accumulation_steps
-        metrics_history = []
-
-        for epoch in range(self.config.training.stage1_epochs):
-            epoch_loss = 0.0
-            epoch_steps = 0
-            start_time = time.time()
-
-            for batch_idx, batch in enumerate(dataloader):
-                # Forward pass
-                loss = self.model.compute_loss(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-
-                # Scale loss for gradient accumulation
-                loss = loss / grad_accum
-                loss.backward()
-
-                if (batch_idx + 1) % grad_accum == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model.model.parameters() if p.requires_grad],
-                        self.config.training.max_grad_norm,
-                    )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    total_steps += 1
-
-                epoch_loss += loss.item() * grad_accum
-                epoch_steps += 1
-
-                if (batch_idx + 1) % self.config.training.logging_steps == 0:
-                    avg_loss = epoch_loss / epoch_steps
-                    logger.info(
-                        f"  Epoch {epoch+1} Step {batch_idx+1}/{len(dataloader)} "
-                        f"Loss={avg_loss:.4f}"
-                    )
-
-            epoch_time = time.time() - start_time
-            avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-            logger.info(
-                f"Epoch {epoch+1}/{self.config.training.stage1_epochs} "
-                f"Loss={avg_epoch_loss:.4f} Time={epoch_time:.1f}s"
-            )
-
-            metrics_history.append({
-                "epoch": epoch + 1,
-                "stage": 1,
-                "loss": avg_epoch_loss,
-                "time": epoch_time,
-            })
-
-            # Save checkpoint
-            if (epoch + 1) % self.config.training.save_every_n_epochs == 0:
-                self._save_checkpoint(f"stage1_epoch{epoch+1}")
-
-            # Validation
-            if val_samples:
-                val_metrics = self._validate(val_samples, prompt_builder)
-                metrics_history[-1].update(val_metrics)
-                logger.info(f"  Val: {val_metrics}")
-
-        return {"stage": 1, "metrics": metrics_history}
+        return self._run_training_loop(
+            dataloader=dataloader,
+            num_epochs=self.config.training.stage1_epochs,
+            stage=1,
+            val_samples=val_samples,
+            prompt_builder=prompt_builder,
+        )
 
     def train_stage2(
         self,
@@ -345,13 +429,12 @@ class VLATrainer:
 
         logger.info(f"Total training steps: {len(all_steps)}")
 
-        # Same training loop as Stage 1, but samples have action history
-        dataset = Mind2WebVLADataset(all_steps, prompt_builder)
+        dataset = Mind2WebVLADataset(all_steps)
 
         from functools import partial
         collate = partial(
-            collate_fn,
-            tokenizer=self.model.tokenizer,
+            multimodal_collate_fn,
+            processor=self.model.processor,
             prompt_builder=prompt_builder,
             max_seq_length=self.config.training.max_seq_length,
         )
@@ -365,68 +448,13 @@ class VLATrainer:
             drop_last=True,
         )
 
-        self.model.model.train()
-        total_steps = 0
-        grad_accum = self.config.training.gradient_accumulation_steps
-        metrics_history = []
-
-        for epoch in range(self.config.training.stage2_epochs):
-            epoch_loss = 0.0
-            epoch_steps = 0
-            start_time = time.time()
-
-            for batch_idx, batch in enumerate(dataloader):
-                loss = self.model.compute_loss(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-
-                loss = loss / grad_accum
-                loss.backward()
-
-                if (batch_idx + 1) % grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model.model.parameters() if p.requires_grad],
-                        self.config.training.max_grad_norm,
-                    )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    total_steps += 1
-
-                epoch_loss += loss.item() * grad_accum
-                epoch_steps += 1
-
-                if (batch_idx + 1) % self.config.training.logging_steps == 0:
-                    avg_loss = epoch_loss / epoch_steps
-                    logger.info(
-                        f"  Epoch {epoch+1} Step {batch_idx+1}/{len(dataloader)} "
-                        f"Loss={avg_loss:.4f}"
-                    )
-
-            epoch_time = time.time() - start_time
-            avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-            logger.info(
-                f"Epoch {epoch+1}/{self.config.training.stage2_epochs} "
-                f"Loss={avg_epoch_loss:.4f} Time={epoch_time:.1f}s"
-            )
-
-            metrics_history.append({
-                "epoch": epoch + 1,
-                "stage": 2,
-                "loss": avg_epoch_loss,
-                "time": epoch_time,
-            })
-
-            if (epoch + 1) % self.config.training.save_every_n_epochs == 0:
-                self._save_checkpoint(f"stage2_epoch{epoch+1}")
-
-            if val_samples:
-                val_metrics = self._validate(val_samples, prompt_builder)
-                metrics_history[-1].update(val_metrics)
-                logger.info(f"  Val: {val_metrics}")
-
-        return {"stage": 2, "metrics": metrics_history}
+        return self._run_training_loop(
+            dataloader=dataloader,
+            num_epochs=self.config.training.stage2_epochs,
+            stage=2,
+            val_samples=val_samples,
+            prompt_builder=prompt_builder,
+        )
 
     def _validate(
         self,
@@ -444,7 +472,6 @@ class VLATrainer:
         correct_actions = 0
         correct_elements = 0
         total = 0
-        total_loss = 0.0
 
         with torch.no_grad():
             for sample in val_subset:
@@ -454,7 +481,7 @@ class VLATrainer:
                         task=sample.task,
                         serialized_dom=sample.serialized_dom,
                         action_history=sample.action_history,
-                        screenshot_placeholder=False,
+                        screenshot_placeholder=(sample.screenshot is not None),
                     )
 
                     # Generate

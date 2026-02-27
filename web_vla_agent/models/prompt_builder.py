@@ -188,6 +188,69 @@ class PromptBuilder:
             "full_text": f"{prompt}\n{target}",
         }
 
+    def build_training_messages(
+        self,
+        task: str,
+        serialized_dom: str,
+        target_action: Dict[str, Any],
+        screenshot: Optional[Any] = None,
+        action_history: Optional[List[Dict[str, Any]]] = None,
+        extra_context: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Build Qwen2-VL chat messages for multimodal training.
+
+        Returns a dict with:
+          - "messages_with_target": full conversation including assistant
+            target (for full tokenization and label masking)
+          - "messages_prompt_only": conversation WITHOUT assistant turn
+            (for computing prompt length to mask labels)
+          - "target_text": the target action JSON string
+
+        These are in Qwen2-VL chat format, compatible with
+        ``processor.apply_chat_template()``.
+        """
+        import json
+
+        text_prompt = self.build_text_prompt(
+            task=task,
+            serialized_dom=serialized_dom,
+            action_history=action_history,
+            extra_context=extra_context,
+        )
+        target_text = json.dumps(target_action, ensure_ascii=False)
+
+        # User content: image (if available) + text
+        user_content = []
+        if screenshot is not None:
+            user_content.append({
+                "type": "image",
+                "image": screenshot,
+            })
+        user_content.append({
+            "type": "text",
+            "text": text_prompt,
+        })
+
+        # Prompt-only messages (no assistant turn) — for computing prompt length
+        messages_prompt_only = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        # Full messages with target — for tokenizing the complete training sequence
+        messages_with_target = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": target_text},
+        ]
+
+        return {
+            "messages_with_target": messages_with_target,
+            "messages_prompt_only": messages_prompt_only,
+            "target_text": target_text,
+        }
+
     def _format_history(self, history: List[Dict[str, Any]]) -> str:
         """Format action history into readable text."""
         entries = history[-self.max_history_entries:]

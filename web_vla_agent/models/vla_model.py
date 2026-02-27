@@ -90,17 +90,17 @@ class VLAModel:
             bnb_config = None
 
         # Load model
-        # NOTE: attn_implementation="eager" is required for training stability.
-        # Qwen2-VL + PEFT (which enables gradient checkpointing) triggers a CUDA
-        # gather index-out-of-bounds assertion when using SDPA attention. Eager
-        # attention avoids this. Flash-Attention-2 is also safe if installed.
+        # NOTE: attn_implementation="eager" is REQUIRED for training stability.
+        # Qwen2-VL + PEFT + gradient checkpointing triggers a CUDA
+        # gather index-out-of-bounds assertion when using SDPA attention.
+        # Eager attention avoids this. Flash-Attention-2 is also safe if installed.
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
             quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16 if not self.load_in_4bit else None,
+            torch_dtype=torch.bfloat16,
             device_map="auto" if self.load_in_4bit else self.device,
             trust_remote_code=True,
-            attn_implementation="sdpa",
+            attn_implementation="eager",
         )
 
         # Load processor (handles both text + vision)
@@ -144,7 +144,7 @@ class VLAModel:
             # warning already visible in training logs.
             self.model = prepare_model_for_kbit_training(
                 self.model,
-                use_gradient_checkpointing=False,
+                use_gradient_checkpointing=True,
                 gradient_checkpointing_kwargs={"use_reentrant": False},
             )
 
@@ -399,18 +399,24 @@ class VLAModel:
         neg_count = int((input_ids < 0).sum())
         oob_count = int((input_ids >= emb_size).sum())
 
-        # Print once for debugging
+        # Log once for debugging
         if not getattr(self, "_ids_debug_printed", False):
-            print("========== TOKEN DIAGNOSTICS ==========")
-            print("Embedding size:", emb_size)
-            print("Min input_id:", min_id)
-            print("Max input_id:", max_id)
-            print("Negative ID count:", neg_count)
-            print("Out-of-bounds count:", oob_count)
-            print("ATTN MASK MIN:", int(attention_mask.min()))
-            print("ATTN MASK MAX:", int(attention_mask.max()))
-            print("ATTN MASK DTYPE:", attention_mask.dtype)
-            print("=======================================")
+            logger.info("========== TOKEN DIAGNOSTICS ==========")
+            logger.info(f"Embedding size: {emb_size}")
+            logger.info(f"Min input_id: {min_id}")
+            logger.info(f"Max input_id: {max_id}")
+            logger.info(f"Negative ID count: {neg_count}")
+            logger.info(f"Out-of-bounds count: {oob_count}")
+            logger.info(f"ATTN MASK MIN: {int(attention_mask.min())}")
+            logger.info(f"ATTN MASK MAX: {int(attention_mask.max())}")
+            logger.info(f"ATTN MASK DTYPE: {attention_mask.dtype}")
+            logger.info(f"pixel_values present: {pixel_values is not None}")
+            logger.info(f"image_grid_thw present: {image_grid_thw is not None}")
+            if pixel_values is not None:
+                logger.info(f"pixel_values shape: {pixel_values.shape}")
+            if image_grid_thw is not None:
+                logger.info(f"image_grid_thw shape: {image_grid_thw.shape}")
+            logger.info("=======================================")
             self._ids_debug_printed = True
 
         # Hard assertions (no silent corruption)
@@ -432,7 +438,9 @@ class VLAModel:
         }
 
         if pixel_values is not None:
-            kwargs["pixel_values"] = pixel_values.to(self.model.device)
+            kwargs["pixel_values"] = pixel_values.to(
+                device=self.model.device, dtype=torch.bfloat16
+            )
 
         if image_grid_thw is not None:
             kwargs["image_grid_thw"] = image_grid_thw.to(self.model.device)
