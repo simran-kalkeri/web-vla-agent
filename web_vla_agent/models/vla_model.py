@@ -383,42 +383,60 @@ class VLAModel:
         """
         Compute token-level cross-entropy loss for training.
 
-        Labels should have -100 for prompt tokens (not in loss).
+        Labels may contain -100.
+        input_ids MUST NOT contain negative values or IDs >= embedding size.
         """
+
         if not self._is_loaded:
             self.load()
 
-        # Safety: clamp input_ids to valid range to prevent hard CUDA crashes.
+        # Get embedding table size
         emb_size = self.model.get_input_embeddings().weight.shape[0]
-        oob_mask = input_ids >= emb_size
-        oob_count = int(oob_mask.sum())
 
-        # One-time diagnostic: confirm embedding table covers all input_ids.
-        if not getattr(self, "_ids_validated", False):
-            max_id = int(input_ids.max())
-            logger.info(
-                f"[vocab check] embedding_size={emb_size}, "
-                f"max_input_id={max_id}, out_of_bounds={oob_count}"
-            )
-            self._ids_validated = True
+        # Compute diagnostics
+        min_id = int(input_ids.min())
+        max_id = int(input_ids.max())
+        neg_count = int((input_ids < 0).sum())
+        oob_count = int((input_ids >= emb_size).sum())
 
-        if oob_count > 0:
-            logger.warning(
-                f"Clamping {oob_count} token IDs >= {emb_size} to {emb_size - 1}"
-            )
-            input_ids = input_ids.clamp(max=emb_size - 1)
+        # Print once for debugging
+        if not getattr(self, "_ids_debug_printed", False):
+            print("========== TOKEN DIAGNOSTICS ==========")
+            print("Embedding size:", emb_size)
+            print("Min input_id:", min_id)
+            print("Max input_id:", max_id)
+            print("Negative ID count:", neg_count)
+            print("Out-of-bounds count:", oob_count)
+            print("=======================================")
+            self._ids_debug_printed = True
 
+        # Hard assertions (no silent corruption)
+        assert neg_count == 0, (
+            f"Negative token IDs detected in input_ids "
+            f"(count={neg_count}, min_id={min_id})"
+        )
+
+        assert oob_count == 0, (
+            f"Token IDs exceed embedding size "
+            f"(count={oob_count}, max_id={max_id}, emb_size={emb_size})"
+        )
+
+        # Move tensors to correct device
         kwargs: Dict[str, Any] = {
             "input_ids": input_ids.to(self.model.device),
             "attention_mask": attention_mask.to(self.model.device),
             "labels": labels.to(self.model.device),
         }
+
         if pixel_values is not None:
             kwargs["pixel_values"] = pixel_values.to(self.model.device)
+
         if image_grid_thw is not None:
             kwargs["image_grid_thw"] = image_grid_thw.to(self.model.device)
 
+        # Forward pass
         outputs = self.model(**kwargs)
+
         return outputs.loss
 
     def _prepare_messages(
