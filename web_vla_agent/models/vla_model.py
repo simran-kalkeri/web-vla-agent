@@ -438,9 +438,7 @@ class VLAModel:
         }
 
         if pixel_values is not None:
-            kwargs["pixel_values"] = pixel_values.to(
-                device=self.model.device, dtype=torch.bfloat16
-            )
+            kwargs["pixel_values"] = pixel_values.to(self.model.device)
 
         if image_grid_thw is not None:
             kwargs["image_grid_thw"] = image_grid_thw.to(self.model.device)

@@ -42,6 +42,8 @@ from utils.config import VLAConfig, load_config
 
 logger = logging.getLogger(__name__)
 
+_COLLATE_LOGGED_FIRST = False
+
 
 def set_seed(seed: int) -> None:
     """Set all random seeds for reproducibility."""
@@ -82,7 +84,7 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     For each sample:
     1. Build Qwen2-VL chat messages (system + user[image+text] + assistant[action])
     2. Render via processor.apply_chat_template()
-    3. Process with processor() to get input_ids + pixel_values + image_grid_thw
+    3. Pass PIL images DIRECTLY to processor() — no process_vision_info
     4. Compute prompt-only length and mask prompt tokens with -100 in labels
 
     Returns dict with:
@@ -92,7 +94,7 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
       - pixel_values: [total_patches, channels] or None
       - image_grid_thw: [num_images, 3] or None
     """
-    from qwen_vl_utils import process_vision_info
+    global _COLLATE_LOGGED_FIRST
 
     all_input_ids = []
     all_labels = []
@@ -125,17 +127,17 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         prompt_text = processor.apply_chat_template(
             messages_prompt,
             tokenize=False,
-            add_generation_prompt=True,  # adds the assistant prefix
+            add_generation_prompt=True,  # adds the <|im_start|>assistant\n prefix
         )
 
-        # 4. Extract vision info from messages
-        image_inputs, video_inputs = process_vision_info(messages_full)
+        # 4. Collect images DIRECTLY from sample — bypass process_vision_info
+        #    which may not handle in-memory PIL Images correctly
+        images = [sample.screenshot] if sample.screenshot is not None else None
 
         # 5. Process full text + images → input_ids, pixel_values, etc.
         full_inputs = processor(
             text=[full_text],
-            images=image_inputs if image_inputs else None,
-            videos=video_inputs if video_inputs else None,
+            images=images,
             padding=False,
             truncation=True,
             max_length=max_seq_length,
@@ -145,11 +147,12 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         input_ids = full_inputs["input_ids"][0]
         attention_mask = full_inputs["attention_mask"][0]
 
-        # 6. Process prompt-only text to get prompt token count
+        # 6. Process prompt-only text WITH SAME images to get correct prompt
+        #    token count (image tokens expand to many <|image_pad|> tokens
+        #    inside the processor based on image resolution)
         prompt_inputs = processor(
             text=[prompt_text],
-            images=image_inputs if image_inputs else None,
-            videos=video_inputs if video_inputs else None,
+            images=images,
             padding=False,
             truncation=True,
             max_length=max_seq_length,
@@ -165,7 +168,7 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         all_labels.append(labels)
         all_attention_mask.append(attention_mask)
 
-        # Collect pixel values and grid info
+        # Collect pixel values and grid info (from full_inputs only)
         if "pixel_values" in full_inputs:
             all_pixel_values.append(full_inputs["pixel_values"])
         if "image_grid_thw" in full_inputs:
@@ -204,6 +207,33 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
     if all_image_grid_thw:
         result["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+
+    # Diagnostic logging (first batch only)
+    if not _COLLATE_LOGGED_FIRST:
+        _COLLATE_LOGGED_FIRST = True
+        logger.info("========== COLLATE DIAGNOSTICS (first batch) ==========")
+        logger.info(f"  input_ids shape: {result['input_ids'].shape}")
+        logger.info(f"  labels shape: {result['labels'].shape}")
+        logger.info(f"  attention_mask shape: {result['attention_mask'].shape}")
+        if "pixel_values" in result:
+            logger.info(f"  pixel_values shape: {result['pixel_values'].shape}")
+            logger.info(f"  pixel_values dtype: {result['pixel_values'].dtype}")
+        else:
+            logger.warning("  pixel_values: MISSING — images not processed!")
+        if "image_grid_thw" in result:
+            logger.info(f"  image_grid_thw shape: {result['image_grid_thw'].shape}")
+            logger.info(f"  image_grid_thw dtype: {result['image_grid_thw'].dtype}")
+            logger.info(f"  image_grid_thw values: {result['image_grid_thw']}")
+        else:
+            logger.warning("  image_grid_thw: MISSING — images not processed!")
+        # Label stats
+        num_target_tokens = (result['labels'] != -100).sum().item()
+        total_tokens = result['labels'].numel()
+        logger.info(
+            f"  Label coverage: {num_target_tokens}/{total_tokens} "
+            f"tokens supervised ({100*num_target_tokens/total_tokens:.1f}%)"
+        )
+        logger.info("=======================================================")
 
     return result
 
