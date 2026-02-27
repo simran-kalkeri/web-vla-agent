@@ -100,7 +100,7 @@ class VLAModel:
             torch_dtype=torch.bfloat16 if not self.load_in_4bit else None,
             device_map="auto" if self.load_in_4bit else self.device,
             trust_remote_code=True,
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
 
         # Load processor (handles both text + vision)
@@ -144,7 +144,7 @@ class VLAModel:
             # warning already visible in training logs.
             self.model = prepare_model_for_kbit_training(
                 self.model,
-                use_gradient_checkpointing=True,
+                use_gradient_checkpointing=False,
                 gradient_checkpointing_kwargs={"use_reentrant": False},
             )
 
