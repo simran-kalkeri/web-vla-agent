@@ -80,9 +80,10 @@ def collate_fn(batch, tokenizer, prompt_builder, max_seq_length=4096):
     """
     Collate Mind2WebSamples into a training batch.
 
-    Builds prompt + target, tokenizes, constructs labels with -100
-    masking on prompt tokens.
+    Builds prompt + target, tokenizes full text once,
+    and masks prompt tokens in labels with -100.
     """
+
     batch_input_ids = []
     batch_labels = []
     batch_attention_mask = []
@@ -100,39 +101,41 @@ def collate_fn(batch, tokenizer, prompt_builder, max_seq_length=4096):
         prompt_text = training["prompt"]
         target_text = "\n" + training["target"]
 
-        # Tokenize prompt and target separately
-        prompt_tokens = tokenizer(
-            prompt_text,
+        # Combine full training text
+        full_text = prompt_text + target_text
+
+        # Tokenize full sequence once
+        tokens = tokenizer(
+            full_text,
             return_tensors="pt",
             truncation=True,
-            max_length=max_seq_length - 100,
+            max_length=max_seq_length,
             add_special_tokens=True,
         )
-        target_tokens = tokenizer(
-            target_text,
-            return_tensors="pt",
-            add_special_tokens=False,
+
+        input_ids = tokens["input_ids"][0]
+        attention_mask = tokens["attention_mask"][0]
+
+        # Determine prompt length (for masking)
+        prompt_tokens = tokenizer(
+            prompt_text,
+            truncation=True,
+            max_length=max_seq_length,
+            add_special_tokens=True,
         )
+        prompt_len = len(prompt_tokens["input_ids"])
 
-        prompt_ids = prompt_tokens["input_ids"][0]
-        target_ids = target_tokens["input_ids"][0]
-
-        # Concatenate
-        input_ids = torch.cat([prompt_ids, target_ids])[:max_seq_length]
-
-        # Labels: -100 for prompt, actual token ids for target
-        labels = torch.cat([
-            torch.full_like(prompt_ids, -100),
-            target_ids,
-        ])[:max_seq_length]
+        # Build labels
+        labels = input_ids.clone()
+        labels[:prompt_len] = -100  # mask prompt tokens
 
         batch_input_ids.append(input_ids)
         batch_labels.append(labels)
-        batch_attention_mask.append(torch.ones_like(input_ids))
+        batch_attention_mask.append(attention_mask)
 
     # Pad to max length in batch
     max_len = max(ids.shape[0] for ids in batch_input_ids)
-    pad_token_id = tokenizer.pad_token_id or 0
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
 
     padded_ids = []
     padded_labels = []
@@ -140,15 +143,30 @@ def collate_fn(batch, tokenizer, prompt_builder, max_seq_length=4096):
 
     for ids, lbls, mask in zip(batch_input_ids, batch_labels, batch_attention_mask):
         pad_len = max_len - ids.shape[0]
-        padded_ids.append(torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)]))
-        padded_labels.append(torch.cat([lbls, torch.full((pad_len,), -100, dtype=lbls.dtype)]))
-        padded_masks.append(torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)]))
+
+        padded_ids.append(
+            torch.cat([
+                ids,
+                torch.full((pad_len,), pad_token_id, dtype=ids.dtype)
+            ])
+        )
+
+        padded_labels.append(
+            torch.cat([
+                lbls,
+                torch.full((pad_len,), -100, dtype=lbls.dtype)
+            ])
+        )
+
+        padded_masks.append(
+            torch.cat([
+                mask,
+                torch.zeros(pad_len, dtype=mask.dtype)
+            ])
+        )
 
     return {
         "input_ids": torch.stack(padded_ids),
-        # Keep attention_mask as long (int64), NOT bool.
-        # bool masks cause a CUDA vectorized_gather_kernel assertion failure when
-        # Qwen2-VL uses SDPA attention with gradient checkpointing enabled by PEFT.
         "attention_mask": torch.stack(padded_masks),
         "labels": torch.stack(padded_labels),
     }
