@@ -150,7 +150,7 @@ class VLAModel:
         # Discover cross-attention / merger modules in the model.
         # Only collect known-safe leaf names to avoid accidentally targeting
         # unrelated modules that share a generic name like 'fc1' or 'mlp'.
-        _VISION_LEAF_NAMES = frozenset({"fc1", "fc2", "mlp", "q_proj", "k_proj", "v_proj", "o_proj"})
+        _VISION_LEAF_NAMES = frozenset({"fc1", "fc2", "q_proj", "k_proj", "v_proj", "o_proj"})
         vision_targets = set()
         for name, _ in self.model.named_modules():
             # Qwen2-VL uses 'visual.merger' for vision-language bridge
