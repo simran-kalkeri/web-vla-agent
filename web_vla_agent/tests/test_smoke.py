@@ -298,7 +298,7 @@ def test_failure_detector():
 def test_data_loader_imports():
     """Data loader imports and instantiates."""
     print("  [9] Testing data loader...", end=" ")
-    from data.mind2web_loader import Mind2WebLoader, Mind2WebSample, Mind2WebCollator
+    from data.mind2web_loader import Mind2WebLoader, Mind2WebSample, Mind2WebTrajectory
 
     loader = Mind2WebLoader(max_dom_nodes=500)
     assert loader.dataset_name == "osunlp/Multimodal-Mind2Web"

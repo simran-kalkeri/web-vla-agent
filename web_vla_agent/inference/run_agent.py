@@ -23,6 +23,7 @@ from models.action_decoder import ActionDecoder
 from models.prompt_builder import PromptBuilder
 from models.uncertainty import TokenUncertainty
 from environment.playwright_env import BrowserEnvironment, BrowserState, WebAction
+from memory.failure_detector import FailureDetector, FailureType
 from utils.config import VLAConfig, load_config
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,11 @@ class VLAAgent:
             viewport_width=self.config.environment.viewport_width,
             viewport_height=self.config.environment.viewport_height,
             use_mock=use_mock,
+        )
+        self.failure_detector = FailureDetector(
+            loop_window=4,
+            stale_threshold=3,
+            max_steps=self.config.environment.max_steps,
         )
 
     def load_model(self, checkpoint: Optional[str] = None) -> None:
@@ -118,6 +124,8 @@ class VLAAgent:
         await self.env.start()
         try:
             state = await self.env.reset(url)
+            self.failure_detector.reset()
+            prev_state_dict: dict | None = None
             logger.info(f"Task: {task}")
             logger.info(f"URL: {url}")
             logger.info(f"Page: {state.page_title}")
@@ -168,8 +176,32 @@ class VLAAgent:
                 web_action = WebAction.from_dict(action)
                 logger.info(f"Executing: {web_action.to_history_string()}")
 
-                state = await self.env.step(web_action)
-                logger.info(f"  → Page: {state.page_title} URL: {state.url}")
+                new_state = await self.env.step(web_action)
+                logger.info(f"  → Page: {new_state.page_title} URL: {new_state.url}")
+
+                # Failure detection
+                curr_state_dict = {
+                    "url": new_state.url,
+                    "page_title": new_state.page_title,
+                    "html_snippet": new_state.dom_tree[:500] if new_state.dom_tree else "",
+                }
+                failure = self.failure_detector.detect(
+                    prev_state=prev_state_dict,
+                    curr_state=curr_state_dict,
+                    action=action,
+                )
+                if failure != FailureType.NONE:
+                    logger.warning(f"Failure detected: {failure.value} — stopping")
+                    return self._make_result(
+                        success=False,
+                        steps=step_results,
+                        start_time=start_time,
+                        url=new_state.url,
+                        error=f"Failure: {failure.value}",
+                    )
+
+                prev_state_dict = curr_state_dict
+                state = new_state
 
             # Max steps reached
             return self._make_result(

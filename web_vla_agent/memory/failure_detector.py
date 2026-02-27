@@ -165,4 +165,4 @@ class FailureDetector:
     @staticmethod
     def _action_signature(action: Dict[str, Any]) -> str:
         """Deterministic string signature for an action."""
-        return f"{action.get('type', '?')}|{action.get('element', '?')}|{action.get('value', '')}"
+        return f"{action.get('action', '?')}|{action.get('element_id', '?')}|{action.get('value', '')}"

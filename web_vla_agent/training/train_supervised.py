@@ -21,9 +21,11 @@ NOT:
 """
 from __future__ import annotations
 
+import os
+os.environ["PYTORCH_SDP_DISABLE"] = "1"
+
 import json
 import logging
-import os
 import random
 import time
 from pathlib import Path
@@ -144,6 +146,9 @@ def collate_fn(batch, tokenizer, prompt_builder, max_seq_length=4096):
 
     return {
         "input_ids": torch.stack(padded_ids),
+        # Keep attention_mask as long (int64), NOT bool.
+        # bool masks cause a CUDA vectorized_gather_kernel assertion failure when
+        # Qwen2-VL uses SDPA attention with gradient checkpointing enabled by PEFT.
         "attention_mask": torch.stack(padded_masks),
         "labels": torch.stack(padded_labels),
     }
@@ -454,6 +459,7 @@ class VLATrainer:
                     total += 1
                 except Exception:
                     total += 1
+                    logger.debug("Validation sample failed", exc_info=True)
 
         self.model.model.train()
 

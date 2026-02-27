@@ -90,12 +90,17 @@ class VLAModel:
             bnb_config = None
 
         # Load model
+        # NOTE: attn_implementation="eager" is required for training stability.
+        # Qwen2-VL + PEFT (which enables gradient checkpointing) triggers a CUDA
+        # gather index-out-of-bounds assertion when using SDPA attention. Eager
+        # attention avoids this. Flash-Attention-2 is also safe if installed.
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
             quantization_config=bnb_config,
             torch_dtype=torch.bfloat16 if not self.load_in_4bit else None,
             device_map="auto" if self.load_in_4bit else self.device,
             trust_remote_code=True,
+            attn_implementation="eager",
         )
 
         # Load processor (handles both text + vision)
