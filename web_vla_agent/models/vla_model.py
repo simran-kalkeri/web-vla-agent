@@ -112,7 +112,7 @@ class VLAModel:
             torch_dtype=torch.bfloat16,
             device_map=device_map,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
 
         # Load processor (handles both text + vision)
