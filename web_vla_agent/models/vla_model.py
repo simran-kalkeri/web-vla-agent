@@ -17,7 +17,7 @@ NOT:
   - Candidate-pool restricted
 """
 from __future__ import annotations
-from PIL import image
+from PIL import Image
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
