@@ -445,7 +445,7 @@ class VLAModel:
             kwargs["pixel_values"] = pixel_values.to(self.model.device)
 
         if image_grid_thw is not None:
-            kwargs["image_grid_thw"] = image_grid_thw.to(self.model.device)
+            kwargs["image_grid_thw"] = image_grid_thw.to(self.model.device).to(torch.int32)
 
         # Forward pass
         outputs = self.model(**kwargs)
