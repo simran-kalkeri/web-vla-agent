@@ -56,7 +56,7 @@ training:
 data:
   dataset_name: "osunlp/Multimodal-Mind2Web"
   max_dom_nodes: 250
-  max_action_history: 10
+  max_action_history: 5
   max_text_per_node: 200
 
 environment:

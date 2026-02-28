@@ -350,7 +350,7 @@ class VLAModel:
                     # reference-counter cannot always collect promptly (especially
                     # with PEFT reference cycles).  A plain tuple is freed as
                     # soon as outputs is deleted.
-                    use_cache=False,
+                    use_cache=True,
                     return_legacy_cache=True,
                 )
         finally:
