@@ -298,8 +298,6 @@ class VLAModel:
                 videos=video_inputs,
                 padding=True,
                 return_tensors="pt",
-                min_pixels=min_px,
-                max_pixels=max_px,
             )
         else:
             inputs = self.processor(
