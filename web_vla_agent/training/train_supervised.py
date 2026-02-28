@@ -300,11 +300,22 @@ class VLATrainer:
         total_steps = 0
         grad_accum = self.config.training.gradient_accumulation_steps
         metrics_history = []
+        num_batches = len(dataloader)
+
+        print(f"\n{'='*60}")
+        print(f"  Stage {stage} Training")
+        print(f"  Epochs: {num_epochs} | Batches/epoch: {num_batches}")
+        print(f"  Batch size: {self.config.training.batch_size} | Grad accum: {grad_accum}")
+        print(f"  Effective batch size: {self.config.training.batch_size * grad_accum}")
+        print(f"  LR: {self.config.training.learning_rate}")
+        print(f"{'='*60}\n")
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             epoch_steps = 0
             start_time = time.time()
+
+            self.optimizer.zero_grad()
 
             for batch_idx, batch in enumerate(dataloader):
                 try:
@@ -318,11 +329,14 @@ class VLATrainer:
                     )
 
                     # Scale loss for gradient accumulation
-                    loss = loss / grad_accum
-                    loss.backward()
+                    scaled_loss = loss / grad_accum
+                    scaled_loss.backward()
+
+                    epoch_loss += loss.item()
+                    epoch_steps += 1
 
                     if (batch_idx + 1) % grad_accum == 0:
-                        # Gradient clipping
+                        # Gradient clipping + optimizer step
                         torch.nn.utils.clip_grad_norm_(
                             [p for p in self.model.model.parameters() if p.requires_grad],
                             self.config.training.max_grad_norm,
@@ -331,21 +345,19 @@ class VLATrainer:
                         self.optimizer.zero_grad()
                         total_steps += 1
 
-                    epoch_loss += loss.item() * grad_accum
-                    epoch_steps += 1
-
-                    if (batch_idx + 1) % self.config.training.logging_steps == 0:
                         avg_loss = epoch_loss / epoch_steps
-                        logger.info(
-                            f"  Epoch {epoch+1} Step {batch_idx+1}/{len(dataloader)} "
-                            f"Loss={avg_loss:.4f}"
+                        print(
+                            f"  ⚡ Step {total_steps} | "
+                            f"Epoch {epoch+1}/{num_epochs} | "
+                            f"Batch {batch_idx+1}/{num_batches} | "
+                            f"Loss: {avg_loss:.4f}"
                         )
 
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
-                        logger.warning(
-                            f"OOM at batch {batch_idx+1}, skipping. "
-                            "Consider reducing max_seq_length or image_max_pixels."
+                        print(
+                            f"  ⚠️  OOM at batch {batch_idx+1}, skipping. "
+                            "Reduce max_seq_length or image_max_pixels."
                         )
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -353,11 +365,27 @@ class VLATrainer:
                         continue
                     raise
 
+            # ── End-of-epoch: flush any remaining accumulated gradients ──
+            # Without this, if num_batches < grad_accum, the optimizer
+            # step never fires and the model never learns.
+            remaining = epoch_steps % grad_accum
+            if remaining > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.model.parameters() if p.requires_grad],
+                    self.config.training.max_grad_norm,
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                total_steps += 1
+
             epoch_time = time.time() - start_time
             avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-            logger.info(
-                f"Epoch {epoch+1}/{num_epochs} "
-                f"Loss={avg_epoch_loss:.4f} Time={epoch_time:.1f}s"
+
+            print(
+                f"  ✅ Epoch {epoch+1}/{num_epochs} complete | "
+                f"Avg Loss: {avg_epoch_loss:.4f} | "
+                f"Time: {epoch_time:.1f}s | "
+                f"Steps so far: {total_steps}"
             )
 
             metrics_history.append({
@@ -375,7 +403,16 @@ class VLATrainer:
             if val_samples and prompt_builder:
                 val_metrics = self._validate(val_samples, prompt_builder)
                 metrics_history[-1].update(val_metrics)
-                logger.info(f"  Val: {val_metrics}")
+                print(
+                    f"  📊 Val — Action Acc: {val_metrics['val_action_acc']:.1%} | "
+                    f"Element Acc: {val_metrics['val_element_acc']:.1%} | "
+                    f"Samples: {val_metrics['val_total']}"
+                )
+
+        print(f"\n{'='*60}")
+        print(f"  Stage {stage} complete — {total_steps} optimizer steps")
+        print(f"  Final loss: {metrics_history[-1]['loss']:.4f}")
+        print(f"{'='*60}\n")
 
         return {"stage": stage, "metrics": metrics_history}
 
