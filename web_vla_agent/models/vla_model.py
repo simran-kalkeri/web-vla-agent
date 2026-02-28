@@ -104,9 +104,14 @@ class VLAModel:
         )
 
         # Load processor (handles both text + vision)
+        # NOTE: use_fast=False is REQUIRED — the fast Qwen2VLImageProcessor
+        # (new default in recent transformers) returns corrupted image_grid_thw
+        # values, causing overflow in the vision encoder's rotary positional
+        # embedding. The slow processor produces correct grid values.
         self.processor = AutoProcessor.from_pretrained(
             model_name,
             trust_remote_code=True,
+            use_fast=False,
         )
         self.tokenizer = self.processor.tokenizer
 

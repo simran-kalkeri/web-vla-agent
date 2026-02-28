@@ -11,19 +11,16 @@ Stage 2: Multi-step imitation (teacher forcing)
   state_0 → action_0, state_1 → action_1, ...
   Action history accumulated across steps
 
-Stage 3 (optional): RL fine-tuning scaffold
-
-NOT:
-  - Classification loss
-  - InfoNCE contrastive loss
-  - Focal loss on action classes
-  - GCN/grounder training
-
 Data flow:
   Mind2WebSample → PromptBuilder.build_training_messages()
-  → processor.apply_chat_template() → processor(text, images)
+  → processor.apply_chat_template() for all samples
+  → processor(text=ALL_TEXTS, images=ALL_IMAGES) — SINGLE CALL
   → {input_ids, attention_mask, pixel_values, image_grid_thw, labels}
   → model.compute_loss()
+
+CRITICAL: The Qwen2-VL processor MUST be called ONCE for the entire batch.
+Per-sample processor calls corrupt the internal pixel_values ↔ image_grid_thw
+mapping and produce garbage grid values that overflow the vision encoder.
 """
 from __future__ import annotations
 
@@ -41,8 +38,6 @@ from torch.utils.data import DataLoader, Dataset
 from utils.config import VLAConfig, load_config
 
 logger = logging.getLogger(__name__)
-
-_COLLATE_LOGGED_FIRST = False
 
 
 def set_seed(seed: int) -> None:
@@ -81,29 +76,27 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     """
     Collate Mind2WebSamples into a multimodal training batch.
 
-    For each sample:
-    1. Build Qwen2-VL chat messages (system + user[image+text] + assistant[action])
-    2. Render via processor.apply_chat_template()
-    3. Pass PIL images DIRECTLY to processor() — no process_vision_info
-    4. Compute prompt-only length and mask prompt tokens with -100 in labels
+    Strategy:
+    1. Build ALL chat-template texts for the batch
+    2. Collect ALL PIL screenshot images
+    3. Call processor() ONCE on the full batch
+    4. Find assistant content boundary via token search for label masking
+
+    The processor handles pixel_values batching, image_grid_thw construction,
+    image token expansion, and padding internally.
 
     Returns dict with:
       - input_ids: [batch, seq_len]
       - attention_mask: [batch, seq_len]
       - labels: [batch, seq_len]  (prompt tokens = -100)
-      - pixel_values: [total_patches, channels] or None
-      - image_grid_thw: [num_images, 3] or None
+      - pixel_values: processor-managed tensor
+      - image_grid_thw: processor-managed tensor
     """
-    global _COLLATE_LOGGED_FIRST
-
-    all_input_ids = []
-    all_labels = []
-    all_attention_mask = []
-    all_pixel_values = []
-    all_image_grid_thw = []
+    all_full_texts = []
+    all_images = []
 
     for sample in batch:
-        # 1. Build multimodal chat messages with target
+        # Build multimodal chat messages with target
         training_data = prompt_builder.build_training_messages(
             task=sample.task,
             serialized_dom=sample.serialized_dom,
@@ -114,128 +107,115 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         )
 
         messages_full = training_data["messages_with_target"]
-        messages_prompt = training_data["messages_prompt_only"]
 
-        # 2. Render full conversation text (with assistant response)
+        # Render full conversation text (system + user + assistant)
         full_text = processor.apply_chat_template(
             messages_full,
             tokenize=False,
             add_generation_prompt=False,
         )
+        all_full_texts.append(full_text)
 
-        # 3. Render prompt-only text (for computing prompt length)
-        prompt_text = processor.apply_chat_template(
-            messages_prompt,
-            tokenize=False,
-            add_generation_prompt=True,  # adds the <|im_start|>assistant\n prefix
-        )
+        # Collect screenshot image (every sample has one — fallback is a white img)
+        if sample.screenshot is not None:
+            all_images.append(sample.screenshot)
 
-        # 4. Collect images DIRECTLY from sample — bypass process_vision_info
-        #    which may not handle in-memory PIL Images correctly
-        images = [sample.screenshot] if sample.screenshot is not None else None
+    # ── SINGLE processor call for the entire batch ──
+    batch_inputs = processor(
+        text=all_full_texts,
+        images=all_images if all_images else None,
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length,
+        return_tensors="pt",
+    )
 
-        # 5. Process full text + images → input_ids, pixel_values, etc.
-        full_inputs = processor(
-            text=[full_text],
-            images=images,
-            padding=False,
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt",
-        )
+    # ── Build labels with prompt masking ──
+    # Strategy: find the last <|im_start|> token in each sequence
+    # (marks the assistant turn), then mask everything before
+    # the assistant's content with -100.
+    labels = batch_inputs["input_ids"].clone()
 
-        input_ids = full_inputs["input_ids"][0]
-        attention_mask = full_inputs["attention_mask"][0]
+    # Get the token ID for <|im_start|>
+    im_start_id = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
 
-        # 6. Process prompt-only text WITH SAME images to get correct prompt
-        #    token count (image tokens expand to many <|image_pad|> tokens
-        #    inside the processor based on image resolution)
-        prompt_inputs = processor(
-            text=[prompt_text],
-            images=images,
-            padding=False,
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt",
-        )
-        prompt_len = prompt_inputs["input_ids"].shape[1]
+    # Tokenize the assistant role header to measure its length
+    # Chat template format: <|im_start|>assistant\n{content}<|im_end|>\n
+    assistant_header_ids = processor.tokenizer.encode(
+        "<|im_start|>assistant\n", add_special_tokens=False
+    )
+    header_len = len(assistant_header_ids)
 
-        # 7. Build labels: mask prompt tokens with -100
-        labels = input_ids.clone()
-        labels[:prompt_len] = -100
+    for i in range(labels.shape[0]):
+        ids = batch_inputs["input_ids"][i]
 
-        all_input_ids.append(input_ids)
-        all_labels.append(labels)
-        all_attention_mask.append(attention_mask)
+        # Find all <|im_start|> positions
+        positions = (ids == im_start_id).nonzero(as_tuple=True)[0]
 
-        # Collect pixel values and grid info (from full_inputs only)
-        if "pixel_values" in full_inputs:
-            all_pixel_values.append(full_inputs["pixel_values"])
-        if "image_grid_thw" in full_inputs:
-            all_image_grid_thw.append(full_inputs["image_grid_thw"])
+        if len(positions) >= 3:
+            # Last <|im_start|> = assistant turn start
+            assistant_start = positions[-1].item()
 
-    # Pad text sequences to max length in batch
-    max_len = max(ids.shape[0] for ids in all_input_ids)
-    pad_token_id = processor.tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = processor.tokenizer.eos_token_id or 0
+            # Content begins after the header: <|im_start|>assistant\n
+            content_start = assistant_start + header_len
 
-    padded_ids = []
-    padded_labels = []
-    padded_masks = []
+            # Mask everything before assistant content (= prompt)
+            labels[i, :content_start] = -100
+        elif len(positions) >= 1:
+            # Fallback: use last <|im_start|> + header
+            assistant_start = positions[-1].item()
+            content_start = assistant_start + header_len
+            labels[i, :content_start] = -100
+        else:
+            # No <|im_start|> found — mask everything (shouldn't happen)
+            print(f"WARNING: No <|im_start|> found in sample {i}, masking all tokens")
+            labels[i, :] = -100
 
-    for ids, lbls, mask in zip(all_input_ids, all_labels, all_attention_mask):
-        pad_len = max_len - ids.shape[0]
-        padded_ids.append(
-            torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
-        )
-        padded_labels.append(
-            torch.cat([lbls, torch.full((pad_len,), -100, dtype=lbls.dtype)])
-        )
-        padded_masks.append(
-            torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
-        )
+        # Mask padding tokens
+        pad_mask = batch_inputs["attention_mask"][i] == 0
+        labels[i, pad_mask] = -100
 
+    # ── Assemble result ──
     result = {
-        "input_ids": torch.stack(padded_ids),
-        "attention_mask": torch.stack(padded_masks),
-        "labels": torch.stack(padded_labels),
+        "input_ids": batch_inputs["input_ids"],
+        "attention_mask": batch_inputs["attention_mask"],
+        "labels": labels,
     }
 
-    # Concatenate pixel_values and image_grid_thw across all samples
-    if all_pixel_values:
-        result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
-    if all_image_grid_thw:
-        result["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+    if "pixel_values" in batch_inputs:
+        result["pixel_values"] = batch_inputs["pixel_values"]
+    if "image_grid_thw" in batch_inputs:
+        result["image_grid_thw"] = batch_inputs["image_grid_thw"]
 
-    # Diagnostic logging (first batch only)
+    # First-batch diagnostics (print to stdout — logger may not be configured)
+    global _COLLATE_LOGGED_FIRST
     if not _COLLATE_LOGGED_FIRST:
         _COLLATE_LOGGED_FIRST = True
-        logger.info("========== COLLATE DIAGNOSTICS (first batch) ==========")
-        logger.info(f"  input_ids shape: {result['input_ids'].shape}")
-        logger.info(f"  labels shape: {result['labels'].shape}")
-        logger.info(f"  attention_mask shape: {result['attention_mask'].shape}")
+        print("========== COLLATE DIAGNOSTICS (first batch) ==========")
+        print(f"  Batch size: {len(batch)}")
+        print(f"  input_ids shape: {result['input_ids'].shape}")
+        print(f"  labels shape: {result['labels'].shape}")
         if "pixel_values" in result:
-            logger.info(f"  pixel_values shape: {result['pixel_values'].shape}")
-            logger.info(f"  pixel_values dtype: {result['pixel_values'].dtype}")
+            print(f"  pixel_values shape: {result['pixel_values'].shape}")
+            print(f"  pixel_values dtype: {result['pixel_values'].dtype}")
         else:
-            logger.warning("  pixel_values: MISSING — images not processed!")
+            print("  pixel_values: MISSING")
         if "image_grid_thw" in result:
-            logger.info(f"  image_grid_thw shape: {result['image_grid_thw'].shape}")
-            logger.info(f"  image_grid_thw dtype: {result['image_grid_thw'].dtype}")
-            logger.info(f"  image_grid_thw values: {result['image_grid_thw']}")
+            print(f"  image_grid_thw shape: {result['image_grid_thw'].shape}")
+            print(f"  image_grid_thw dtype: {result['image_grid_thw'].dtype}")
+            print(f"  image_grid_thw values:\n{result['image_grid_thw']}")
         else:
-            logger.warning("  image_grid_thw: MISSING — images not processed!")
+            print("  image_grid_thw: MISSING")
         # Label stats
-        num_target_tokens = (result['labels'] != -100).sum().item()
-        total_tokens = result['labels'].numel()
-        logger.info(
-            f"  Label coverage: {num_target_tokens}/{total_tokens} "
-            f"tokens supervised ({100*num_target_tokens/total_tokens:.1f}%)"
-        )
-        logger.info("=======================================================")
+        num_target = (result["labels"] != -100).sum().item()
+        total = result["labels"].numel()
+        print(f"  Supervised tokens: {num_target}/{total} ({100*num_target/total:.1f}%)")
+        print("=======================================================")
 
     return result
+
+
+_COLLATE_LOGGED_FIRST = False
 
 
 # ── Trainer ──────────────────────────────────────────────────
