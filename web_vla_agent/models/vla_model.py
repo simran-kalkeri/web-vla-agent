@@ -149,8 +149,7 @@ class VLAModel:
             # warning already visible in training logs.
             self.model = prepare_model_for_kbit_training(
                 self.model,
-                use_gradient_checkpointing=True,
-                gradient_checkpointing_kwargs={"use_reentrant": False},
+                use_gradient_checkpointing=False,
             )
 
         # Build target modules list — include vision merger layers
