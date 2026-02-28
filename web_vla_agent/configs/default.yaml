@@ -5,7 +5,7 @@
 model:
   # Multimodal VLM backbone
   name: "Qwen/Qwen2-VL-2B-Instruct"
-  max_new_tokens: 256
+  max_new_tokens: 64
   temperature: 0.1
   top_p: 0.9
   repetition_penalty: 1.1
@@ -20,7 +20,7 @@ model:
 
   # Image resolution limits for Qwen2-VL processor (conservative for 48GB GPU)
   image_min_pixels: 43904      # 56 * 28 * 28 — ~150 vision tokens min
-  image_max_pixels: 401408     # 512 * 28 * 28 — ~450 vision tokens max
+  image_max_pixels: 250000    # 512 * 28 * 28 — ~450 vision tokens max
 
   # Action types
   action_types: ["CLICK", "TYPE", "SELECT", "SCROLL"]
@@ -55,7 +55,7 @@ training:
 
 data:
   dataset_name: "osunlp/Multimodal-Mind2Web"
-  max_dom_nodes: 500
+  max_dom_nodes: 250
   max_action_history: 10
   max_text_per_node: 200
 
