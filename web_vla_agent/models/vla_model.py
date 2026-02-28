@@ -17,7 +17,7 @@ NOT:
   - Candidate-pool restricted
 """
 from __future__ import annotations
-
+from PIL import image
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -285,6 +285,12 @@ class VLAModel:
 
         if image is not None:
             from qwen_vl_utils import process_vision_info
+                # Hard resize to control vision token count
+            max_dim = 1024  # or 768 for even more safety
+            if max(image.size) > max_dim:
+                scale = max_dim / max(image.size)
+                new_size = (int(image.size[0] * scale), int(image.size[1] * scale))
+                image = image.resize(new_size, Image.BICUBIC)
             image_inputs, video_inputs = process_vision_info(processed_messages)
             inputs = self.processor(
                 text=[text],
