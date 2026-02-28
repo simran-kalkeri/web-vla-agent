@@ -130,6 +130,19 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         return_tensors="pt",
     )
 
+    # ── Ensure batch dimension exists for vision tensors ──
+    # When batch_size=1, the Qwen2-VL processor collapses the batch dim
+    # for pixel_values (returns [num_patches, hidden_dim] instead of
+    # [batch, num_patches, hidden_dim]) and image_grid_thw (returns [3]
+    # instead of [1, 3]). This causes corruption in vision rotary embeddings.
+    if "pixel_values" in batch_inputs:
+        if batch_inputs["pixel_values"].dim() == 2:
+            batch_inputs["pixel_values"] = batch_inputs["pixel_values"].unsqueeze(0)
+
+    if "image_grid_thw" in batch_inputs:
+        if batch_inputs["image_grid_thw"].dim() == 1:
+            batch_inputs["image_grid_thw"] = batch_inputs["image_grid_thw"].unsqueeze(0)
+
     # ── Build labels with prompt masking ──
     # Strategy: find the last <|im_start|> token in each sequence
     # (marks the assistant turn), then mask everything before
