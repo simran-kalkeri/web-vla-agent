@@ -297,6 +297,8 @@ class VLAModel:
                 images=image_inputs,
                 videos=video_inputs,
                 padding=True,
+                truncation=True,
+                max_length=1024,
                 return_tensors="pt",
             )
         else:

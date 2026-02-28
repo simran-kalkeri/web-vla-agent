@@ -51,7 +51,7 @@ training:
   logging_steps: 10
 
   # Dataset
-  max_seq_length: 2048
+  max_seq_length: 1024
 
 data:
   dataset_name: "osunlp/Multimodal-Mind2Web"
