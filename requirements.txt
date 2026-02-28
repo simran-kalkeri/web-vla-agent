@@ -1,0 +1,14 @@
+# VLA Web Agent — Pinned Dependencies
+# Compatible with Qwen2-VL multimodal training + QLoRA
+
+torch>=2.1.0,<2.5.0
+transformers>=4.45.0,<4.48.0
+peft>=0.12.0,<0.15.0
+accelerate>=0.34.0,<0.37.0
+bitsandbytes>=0.43.0,<0.45.0
+qwen-vl-utils>=0.0.8
+Pillow>=10.0
+numpy>=1.24,<2.0
+datasets>=2.14
+pyyaml>=6.0
+tqdm>=4.65

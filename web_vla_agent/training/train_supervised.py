@@ -130,15 +130,10 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         return_tensors="pt",
     )
 
-    # ── Ensure batch dimension exists for vision tensors ──
-    # When batch_size=1, the Qwen2-VL processor collapses the batch dim
-    # for pixel_values (returns [num_patches, hidden_dim] instead of
-    # [batch, num_patches, hidden_dim]) and image_grid_thw (returns [3]
-    # instead of [1, 3]). This causes corruption in vision rotary embeddings.
-    if "pixel_values" in batch_inputs:
-        if batch_inputs["pixel_values"].dim() == 2:
-            batch_inputs["pixel_values"] = batch_inputs["pixel_values"].unsqueeze(0)
-
+    # ── Ensure batch dimension exists for image_grid_thw ──
+    # Qwen2-VL processor pixel_values shape is ALWAYS [total_patches, hidden_dim]
+    # (no batch dimension) — this is correct, do NOT unsqueeze it.
+    # Only image_grid_thw may collapse from [1,3] → [3] when batch_size=1.
     if "image_grid_thw" in batch_inputs:
         if batch_inputs["image_grid_thw"].dim() == 1:
             batch_inputs["image_grid_thw"] = batch_inputs["image_grid_thw"].unsqueeze(0)

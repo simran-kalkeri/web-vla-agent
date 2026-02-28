@@ -98,7 +98,7 @@ class VLAModel:
             model_name,
             quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto" if self.load_in_4bit else self.device,
+            device_map={"":0},   # pin to single GPU — no accelerate sharding
             trust_remote_code=True,
             attn_implementation="eager",
         )
@@ -144,12 +144,13 @@ class VLAModel:
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         if self.load_in_4bit:
-            # use_reentrant=False is required to avoid a hard error in PyTorch >=2.9
-            # and suppresses the "use_reentrant parameter should be passed explicitly"
-            # warning already visible in training logs.
+            # Gradient checkpointing saves ~40% VRAM on multimodal forward passes.
+            # use_reentrant=False is REQUIRED for PEFT + bitsandbytes compatibility
+            # and avoids PyTorch >=2.4 deprecation warnings.
             self.model = prepare_model_for_kbit_training(
                 self.model,
-                use_gradient_checkpointing=False,
+                use_gradient_checkpointing=True,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
             )
 
         # Build target modules list — include vision merger layers
@@ -272,7 +273,18 @@ class VLAModel:
                 return_tensors="pt",
             )
 
-        inputs = inputs.to(self.model.device)
+        # Selective device transfer — preserve int64 dtype on image_grid_thw
+        device = self.model.device
+        inputs["input_ids"] = inputs["input_ids"].to(device)
+        inputs["attention_mask"] = inputs["attention_mask"].to(device)
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(
+                device=device, dtype=torch.bfloat16
+            )
+        if "image_grid_thw" in inputs:
+            inputs["image_grid_thw"] = inputs["image_grid_thw"].to(
+                device=device, dtype=torch.int64
+            )
         input_len = inputs["input_ids"].shape[-1]
 
         # Generate
@@ -353,7 +365,18 @@ class VLAModel:
                 text=[text], padding=True, return_tensors="pt",
             )
 
-        inputs = inputs.to(self.model.device)
+        # Selective device transfer — preserve dtypes
+        device = self.model.device
+        inputs["input_ids"] = inputs["input_ids"].to(device)
+        inputs["attention_mask"] = inputs["attention_mask"].to(device)
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(
+                device=device, dtype=torch.bfloat16
+            )
+        if "image_grid_thw" in inputs:
+            inputs["image_grid_thw"] = inputs["image_grid_thw"].to(
+                device=device, dtype=torch.int64
+            )
         input_len = inputs["input_ids"].shape[-1]
 
         with torch.no_grad():
@@ -434,18 +457,28 @@ class VLAModel:
             f"(count={oob_count}, max_id={max_id}, emb_size={emb_size})"
         )
 
-        # Move tensors to correct device
+        # Move tensors to correct device with correct dtypes
+        device = self.model.device
         kwargs: Dict[str, Any] = {
-            "input_ids": input_ids.to(self.model.device),
-            "attention_mask": attention_mask.to(self.model.device),
-            "labels": labels.to(self.model.device),
+            "input_ids": input_ids.to(device),
+            "attention_mask": attention_mask.to(device),
+            "labels": labels.to(device),
         }
 
         if pixel_values is not None:
-            kwargs["pixel_values"] = pixel_values.to(self.model.device)
+            # Cast to model compute dtype — processor returns float32,
+            # but vision encoder runs in bfloat16 under QLoRA
+            kwargs["pixel_values"] = pixel_values.to(
+                device=device, dtype=torch.bfloat16
+            )
 
         if image_grid_thw is not None:
-            kwargs["image_grid_thw"] = image_grid_thw.to(self.model.device).to(torch.int32)
+            # MUST be int64 (torch.LongTensor) — HF docs specify this.
+            # rot_pos_emb uses torch.arange(h) where h comes from grid_thw.
+            # int32 causes silent overflow on large grids.
+            kwargs["image_grid_thw"] = image_grid_thw.to(
+                device=device, dtype=torch.int64
+            )
 
         # Forward pass
         outputs = self.model(**kwargs)
