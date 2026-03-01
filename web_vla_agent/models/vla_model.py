@@ -98,7 +98,7 @@ class VLAModel:
             model_name,
             quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
-            device_map={"":0},   # pin to single GPU — no accelerate sharding
+            device_map="auto",   # pin to single GPU — no accelerate sharding
             trust_remote_code=True,
             attn_implementation="eager",
         )
