@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+
+# Reduce CUDA memory fragmentation (recommended by PyTorch for large models)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -119,6 +123,8 @@ class VLAEvaluator:
         """
         eval_samples = samples[:max_samples] if max_samples else samples
 
+        import torch
+
         for i, sample in enumerate(eval_samples):
             try:
                 # Build prompt
@@ -158,8 +164,11 @@ class VLAEvaluator:
                     ground_truth_action=sample.action,
                     parse_success=False,
                 ))
+            finally:
+                # Free any cached activations / KV-cache from this sample
+                torch.cuda.empty_cache()
 
-            if (i + 1) % 50 == 0:
+            if (i + 1) % 10 == 0:
                 logger.info(f"Evaluated {i + 1}/{len(eval_samples)}")
 
         return self.compute_metrics()
@@ -305,6 +314,12 @@ def main():
     parser.add_argument("--split", type=str, default="test_task")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--load-in-4bit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load model in 4-bit QLoRA (default: True — matches training setup)",
+    )
     args = parser.parse_args()
 
     from utils.config import load_config
@@ -317,8 +332,10 @@ def main():
     config = load_config(args.config)
     log = get_logger("vla.eval")
 
-    # Load model
-    model = VLAModel(config=config, device=args.device)
+    # Load model — must use the same quantization config as training (4-bit QLoRA)
+    # to avoid CUDA OOM.  Full bfloat16 needs ~14 GB just for weights; 4-bit
+    # cuts that to ~3.5 GB, easily fitting alongside LoRA adapters.
+    model = VLAModel(config=config, device=args.device, load_in_4bit=args.load_in_4bit)
     model.load()
     if args.checkpoint:
         model.load_lora(args.checkpoint)
