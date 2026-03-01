@@ -12,6 +12,7 @@ Implements all required metrics:
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import time
 
 # Reduce CUDA memory fragmentation (recommended by PyTorch for large models)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -126,6 +128,7 @@ class VLAEvaluator:
         import torch
 
         for i, sample in enumerate(eval_samples):
+            result = None
             try:
                 # Build prompt
                 messages = prompt_builder.build_chat_messages(
@@ -136,12 +139,16 @@ class VLAEvaluator:
                     extra_context=f"Website: {sample.website}" if sample.website else "",
                 )
 
-                # Generate with timing
+                # Generate with timing.
+                # return_log_probs=False by default: disables output_scores=True,
+                # which would otherwise accumulate 256 × vocab_size logit tensors
+                # (~77 MB) on GPU per call.  Enable only when confidence-gated
+                # re-generation is needed.
                 start = time.time()
                 result = model.generate(
                     messages=messages,
                     image=sample.screenshot,
-                    return_log_probs=True,
+                    return_log_probs=False,
                 )
                 latency_ms = (time.time() - start) * 1000
 
@@ -165,11 +172,20 @@ class VLAEvaluator:
                     parse_success=False,
                 ))
             finally:
-                # Free any cached activations / KV-cache from this sample
+                # Correct cleanup order:
+                #   1. del result   — drop Python reference so refcount hits 0
+                #   2. gc.collect() — collect reference cycles from PEFT/Accelerate
+                #                     hooks that CPython's refcount alone misses
+                #   3. empty_cache() — only NOW can the CUDA allocator reclaim
+                #                      memory from tensors with zero references
+                # Calling empty_cache() BEFORE del/gc is a no-op for live tensors.
+                del result
+                gc.collect()
                 torch.cuda.empty_cache()
 
             if (i + 1) % 10 == 0:
-                logger.info(f"Evaluated {i + 1}/{len(eval_samples)}")
+                mem_mb = torch.cuda.memory_allocated() / 1024 ** 2
+                logger.info(f"Evaluated {i + 1}/{len(eval_samples)} | GPU mem: {mem_mb:.0f} MB")
 
         return self.compute_metrics()
 
