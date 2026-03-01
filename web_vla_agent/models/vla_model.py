@@ -524,6 +524,19 @@ class VLAModel:
         """Load LoRA adapter weights."""
         if not self._is_loaded:
             self.load()
+
+        # Resize embeddings to match what was done during training (apply_lora).
+        # The base model vocab size (151936) differs from the tokenizer size used
+        # at training time, so we must resize before loading the checkpoint or
+        # PEFT will raise a size-mismatch RuntimeError.
+        actual_emb_size = self.model.get_input_embeddings().weight.shape[0]
+        tokenizer_size = len(self.tokenizer)
+        if tokenizer_size != actual_emb_size:
+            logger.info(
+                f"load_lora: resizing token embeddings {actual_emb_size} -> {tokenizer_size}"
+            )
+            self.model.resize_token_embeddings(tokenizer_size)
+
         from peft import PeftModel
         self.model = PeftModel.from_pretrained(self.model, path)
         logger.info(f"LoRA adapters loaded from {path}")
