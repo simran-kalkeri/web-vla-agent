@@ -317,12 +317,13 @@ def main():
     parser.add_argument(
         "--load-in-4bit",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Load model in 4-bit QLoRA. Default: False for evaluation. "
-            "4-bit + PEFT + device_map=auto (multi-GPU) causes a CUDA illegal "
-            "memory access in bitsandbytes. With 2+ GPUs you have enough VRAM "
-            "for bfloat16 anyway. Use --load-in-4bit only for single-GPU eval."
+            "Load model in 4-bit QLoRA (default: True). "
+            "MUST match training setup — LoRA adapters trained on 4-bit base weights "
+            "produce NaN/inf logits when run on bfloat16 base weights. "
+            "4-bit automatically pins to a single GPU to avoid a PEFT multi-GPU bug. "
+            "Pass --no-load-in-4bit for bfloat16 multi-GPU (only if LoRA was NOT QLoRA-trained)."
         ),
     )
     args = parser.parse_args()

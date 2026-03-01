@@ -94,11 +94,23 @@ class VLAModel:
         # Qwen2-VL + PEFT + gradient checkpointing triggers a CUDA
         # gather index-out-of-bounds assertion when using SDPA attention.
         # Eager attention avoids this. Flash-Attention-2 is also safe if installed.
+        # device_map strategy:
+        # - 4-bit (QLoRA): pin to a single GPU.  PEFT's adapter injection
+        #   (_move_adapter_to_device_of_base_layer) triggers a CUDA illegal
+        #   memory access when the base model is sharded across GPUs with
+        #   bitsandbytes 4-bit.  A 4-bit model is small enough (~4 GB for 7B)
+        #   that a single 47 GB GPU is more than sufficient.
+        # - bfloat16: use device_map="auto" to shard across all visible GPUs.
+        if self.load_in_4bit:
+            device_map = {"":0}  # single GPU — required for PEFT + 4-bit
+        else:
+            device_map = "auto"  # multi-GPU shard for bfloat16
+
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
             quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto",   # pin to single GPU — no accelerate sharding
+            device_map=device_map,
             trust_remote_code=True,
             attn_implementation="eager",
         )
