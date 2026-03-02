@@ -31,7 +31,6 @@ def test_config():
     from utils.config import load_config
     cfg = load_config()
     assert cfg.model.name == "Qwen/Qwen2-VL-2B-Instruct"
-    assert cfg.model.use_qlora is True
     assert cfg.model.lora_r == 16
     assert cfg.training.stage1_epochs == 5
     assert cfg.training.stage2_epochs == 10

@@ -20,8 +20,7 @@ class ModelConfig:
     temperature: float = 0.1
     top_p: float = 0.9
     repetition_penalty: float = 1.1
-    # QLoRA
-    use_qlora: bool = True
+    # LoRA
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -29,7 +28,6 @@ class ModelConfig:
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj",
                                   "gate_proj", "up_proj", "down_proj"]
     )
-    quantization_bits: int = 4
     action_types: List[str] = field(
         default_factory=lambda: ["CLICK", "TYPE", "SELECT", "SCROLL"]
     )

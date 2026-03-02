@@ -10,13 +10,11 @@ model:
   top_p: 0.9
   repetition_penalty: 1.1
 
-  # QLoRA configurationF
-  use_qlora: true
+  # LoRA configuration
   lora_r: 16
   lora_alpha: 32
   lora_dropout: 0.05
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-  quantization_bits: 4
 
   # Image resolution limits for Qwen2-VL processor (conservative for 48GB GPU)
   image_min_pixels: 43904      # 56 * 28 * 28 — ~150 vision tokens min
@@ -51,7 +49,7 @@ training:
   logging_steps: 10
 
   # Dataset
-  max_seq_length: 1024
+  max_seq_length: 2048
 
 data:
   dataset_name: "osunlp/Multimodal-Mind2Web"

@@ -5,16 +5,16 @@ End-to-end multimodal web agent using Qwen2-VL as backbone.
 All tokens (task, DOM, action history, screenshot patches) fully cross-attend.
 
 Architecture:
-  - Qwen2-VL-2B-Instruct (or 7B) with QLoRA (4-bit + LoRA adapters)
+  - Qwen2-VL-2B-Instruct (or 7B) in pure bfloat16 + LoRA adapters
   - Full vision-language cross-attention (no bi-encoder)
   - Autoregressive JSON action generation
   - Token-level log probability extraction for uncertainty
 
-NOT:
-  - A bi-encoder (MiniLM + CLIP)
-  - A classification head
-  - CPU-optimized
-  - Candidate-pool restricted
+Stability rules:
+  - No quantization (no bitsandbytes, no triton)
+  - No manual image resizing (processor handles it)
+  - No process_vision_info (direct processor call, matching training)
+  - processor.image_processor.min_pixels/max_pixels set to match training
 """
 from __future__ import annotations
 from PIL import Image
@@ -35,7 +35,7 @@ class VLAModel:
     Multimodal VLA Web Agent backed by Qwen2-VL.
 
     Supports:
-      - GPU inference with QLoRA (4-bit quantization + LoRA adapters)
+      - GPU inference in pure bfloat16 + LoRA adapters
       - Autoregressive JSON action generation
       - Token-level log probability extraction
       - Beam search for uncertainty estimation
@@ -45,19 +45,15 @@ class VLAModel:
     config : VLAConfig, optional
     device : str
         Device for inference ('cuda', 'cuda:0', etc.)
-    load_in_4bit : bool
-        Whether to use 4-bit quantization (QLoRA).
     """
 
     def __init__(
         self,
         config: Optional[VLAConfig] = None,
         device: str = "cuda",
-        load_in_4bit: Optional[bool] = None,
     ):
         self.config = config or load_config()
         self.device = device
-        self.load_in_4bit = load_in_4bit if load_in_4bit is not None else self.config.model.use_qlora
 
         self.model = None
         self.processor = None
@@ -65,52 +61,21 @@ class VLAModel:
         self._is_loaded = False
 
     def load(self) -> None:
-        """Load model, processor, and tokenizer."""
+        """Load model, processor, and tokenizer in pure bfloat16."""
         if self._is_loaded:
             return
 
         model_name = self.config.model.name
-        logger.info(f"Loading {model_name} (4-bit={self.load_in_4bit})...")
+        logger.info(f"Loading {model_name} in bfloat16...")
 
-        from transformers import (
-            Qwen2VLForConditionalGeneration,
-            AutoProcessor,
-            BitsAndBytesConfig,
-        )
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
-        # Quantization config
-        if self.load_in_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-            )
-        else:
-            bnb_config = None
-
-        # Load model
-        # NOTE: attn_implementation="eager" is REQUIRED for training stability.
-        # Qwen2-VL + PEFT + gradient checkpointing triggers a CUDA
-        # gather index-out-of-bounds assertion when using SDPA attention.
-        # Eager attention avoids this. Flash-Attention-2 is also safe if installed.
-        # device_map strategy:
-        # - 4-bit (QLoRA): pin to a single GPU.  PEFT's adapter injection
-        #   (_move_adapter_to_device_of_base_layer) triggers a CUDA illegal
-        #   memory access when the base model is sharded across GPUs with
-        #   bitsandbytes 4-bit.  A 4-bit model is small enough (~4 GB for 7B)
-        #   that a single 47 GB GPU is more than sufficient.
-        # - bfloat16: use device_map="auto" to shard across all visible GPUs.
-        if self.load_in_4bit:
-            device_map = {"":0}  # single GPU — required for PEFT + 4-bit
-        else:
-            device_map = "auto"  # multi-GPU shard for bfloat16
-
+        # Load model — pure bfloat16, no quantization.
+        # device_map="auto" shards across available GPUs.
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
-            quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
-            device_map=device_map,
+            device_map="auto",
             trust_remote_code=True,
             attn_implementation="sdpa",
         )
@@ -127,9 +92,25 @@ class VLAModel:
         )
         self.tokenizer = self.processor.tokenizer
 
-        # NOTE: Embedding resize is deferred to apply_lora().
-        # prepare_model_for_kbit_training() and get_peft_model() can
-        # interfere with a resize done here, so we resize AFTER those calls.
+        # Set image processor resolution limits to MATCH TRAINING exactly.
+        # Training (train_supervised.py:265-269) sets these on the processor.
+        # Without this, the processor uses different defaults and produces
+        # different vision token counts → distribution drift.
+        if hasattr(self.processor, "image_processor"):
+            self.processor.image_processor.min_pixels = (
+                self.config.model.image_min_pixels
+            )
+            self.processor.image_processor.max_pixels = (
+                self.config.model.image_max_pixels
+            )
+            logger.info(
+                f"Image processor: min_pixels={self.config.model.image_min_pixels}, "
+                f"max_pixels={self.config.model.image_max_pixels}"
+            )
+
+        # NOTE: Embedding resize is deferred to apply_lora() / load_lora().
+        # get_peft_model() can interfere with a resize done here,
+        # so we resize AFTER those calls.
 
         self._is_loaded = True
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -153,17 +134,7 @@ class VLAModel:
         if not self._is_loaded:
             self.load()
 
-        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-        if self.load_in_4bit:
-            # Gradient checkpointing saves ~40% VRAM on multimodal forward passes.
-            # use_reentrant=False is REQUIRED for PEFT + bitsandbytes compatibility
-            # and avoids PyTorch >=2.4 deprecation warnings.
-            self.model = prepare_model_for_kbit_training(
-                self.model,
-                use_gradient_checkpointing=True,
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-            )
+        from peft import LoraConfig, get_peft_model
 
         # Build target modules list — include vision merger layers
         target_modules = list(self.config.model.lora_target_modules)
@@ -239,13 +210,19 @@ class VLAModel:
         this function returns.  Call torch.cuda.empty_cache() + gc.collect()
         *after* this function — NOT inside it — so the caller controls cadence.
 
+        Preprocessing contract
+        ----------------------
+        Mirrors training exactly:
+          - processor(text=..., images=...) — direct call, NO process_vision_info
+          - NO manual image resizing — processor.image_processor handles it
+          - min_pixels/max_pixels set on processor during load() to match training
+
         Parameters
         ----------
         messages : list of dicts
             Chat-format messages (system + user with text + image).
         image : PIL.Image, optional
-            Screenshot image.  Capped to config.model.image_max_pixels before
-            being sent to the vision encoder.
+            Screenshot image.
         max_new_tokens : int, optional
         temperature : float, optional
         return_log_probs : bool
@@ -274,31 +251,17 @@ class VLAModel:
             add_generation_prompt=True,
         )
 
-        # Process inputs (text + image).
-        # IMPORTANT: pass min_pixels / max_pixels so the vision encoder never
-        # receives more patches than we budget for.  Without this, a raw
-        # 1280×720 screenshot produces ~1024 vision tokens; with the cap it
-        # stays ≤450.  Each extra vision token adds ~29 KB to the KV cache
-        # across 28 layers.
-        min_px = getattr(self.config.model, "image_min_pixels", 43904)
-        max_px = getattr(self.config.model, "image_max_pixels", 401408)
-
+        # Process inputs — direct processor call, matching training exactly.
+        # Training collator (train_supervised.py:124-131) calls:
+        #   processor(text=..., images=..., padding=True, return_tensors="pt")
+        # We mirror this. No process_vision_info, no manual resize.
+        # The processor.image_processor.min_pixels/max_pixels (set in load())
+        # control vision token count, matching training configuration.
         if image is not None:
-            from qwen_vl_utils import process_vision_info
-                # Hard resize to control vision token count
-            max_dim = 1024  # or 768 for even more safety
-            if max(image.size) > max_dim:
-                scale = max_dim / max(image.size)
-                new_size = (int(image.size[0] * scale), int(image.size[1] * scale))
-                image = image.resize(new_size, Image.BICUBIC)
-            image_inputs, video_inputs = process_vision_info(processed_messages)
             inputs = self.processor(
                 text=[text],
-                images=image_inputs,
-                videos=video_inputs,
+                images=[image],
                 padding=True,
-                truncation=True,
-                max_length=1024,
                 return_tensors="pt",
             )
         else:
@@ -326,14 +289,12 @@ class VLAModel:
         del inputs  # free CPU-side tensors immediately
 
         # Greedy vs. sampling.
-        # temperature=0 → greedy → no probability tensor → no NaN risk.
         do_sample = temperature > 0.01
         gen_temperature = max(temperature, 0.01) if do_sample else 1.0
 
         # torch.inference_mode() is stricter than no_grad:
         # - disables autograd graph construction entirely
         # - prevents accidental version-counter bumps from PEFT hooks
-        # - allows more aggressive kernel fusion → ~5–15% less activation VRAM
         try:
             with torch.inference_mode():
                 outputs = self.model.generate(
@@ -346,12 +307,6 @@ class VLAModel:
                     pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                     output_scores=return_log_probs,
                     return_dict_in_generate=return_log_probs,
-                    # return_legacy_cache=True forces the KV cache to be a plain
-                    # tuple of tensors instead of a DynamicCache object.  The
-                    # DynamicCache holds Python-level references that CPython's
-                    # reference-counter cannot always collect promptly (especially
-                    # with PEFT reference cycles).  A plain tuple is freed as
-                    # soon as outputs is deleted.
                     use_cache=True,
                     return_legacy_cache=True,
                 )
@@ -368,21 +323,17 @@ class VLAModel:
 
             # Extract log-probs iteratively — process one score tensor at a time
             # so we never hold the full 256×vocab_size block in memory at once.
-            # Each tensor is consumed (.item()) and immediately released.
             log_probs: List[float] = []
-            scores_tuple = outputs.scores  # local ref to the tuple only
+            scores_tuple = outputs.scores
             del outputs  # release sequences + past_key_values NOW
 
             for i, score in enumerate(scores_tuple):
                 if i >= len(generated_ids):
                     break
-                # Guard against NaN/inf from bfloat16 instability or
-                # mismatched base weights (should not happen in 4-bit mode,
-                # but safe to clamp defensively).
                 score_clamped = torch.clamp(score[0].float(), min=-1e4, max=1e4)
                 log_softmax = F.log_softmax(score_clamped, dim=-1)
                 log_probs.append(log_softmax[generated_ids[i]].item())
-                del score_clamped, log_softmax  # release each step immediately
+                del score_clamped, log_softmax
 
             del scores_tuple
 
@@ -412,6 +363,7 @@ class VLAModel:
         Generate multiple beam hypotheses for uncertainty estimation.
 
         Returns list of dicts, each with "text" and "score".
+        Uses same preprocessing contract as generate() — mirrors training.
         """
         if not self._is_loaded:
             self.load()
@@ -423,11 +375,10 @@ class VLAModel:
             processed_messages, tokenize=False, add_generation_prompt=True,
         )
 
+        # Direct processor call — matching training, no process_vision_info.
         if image is not None:
-            from qwen_vl_utils import process_vision_info
-            image_inputs, video_inputs = process_vision_info(processed_messages)
             inputs = self.processor(
-                text=[text], images=image_inputs, videos=video_inputs,
+                text=[text], images=[image],
                 padding=True, return_tensors="pt",
             )
         else:
@@ -435,30 +386,37 @@ class VLAModel:
                 text=[text], padding=True, return_tensors="pt",
             )
 
-        # Selective device transfer — preserve dtypes
+        # Move to GPU with correct dtypes
         device = self.model.device
-        inputs["input_ids"] = inputs["input_ids"].to(device)
-        inputs["attention_mask"] = inputs["attention_mask"].to(device)
+        gpu_inputs: Dict[str, Any] = {}
+        gpu_inputs["input_ids"] = inputs["input_ids"].to(device)
+        gpu_inputs["attention_mask"] = inputs["attention_mask"].to(device)
         if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(
+            gpu_inputs["pixel_values"] = inputs["pixel_values"].to(
                 device=device, dtype=torch.bfloat16
             )
         if "image_grid_thw" in inputs:
-            inputs["image_grid_thw"] = inputs["image_grid_thw"].to(
+            gpu_inputs["image_grid_thw"] = inputs["image_grid_thw"].to(
                 device=device, dtype=torch.int64
             )
-        input_len = inputs["input_ids"].shape[-1]
+        input_len = gpu_inputs["input_ids"].shape[-1]
+        del inputs
 
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                num_beams=num_beams,
-                num_return_sequences=num_beams,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                output_scores=True,
-                return_dict_in_generate=True,
-            )
+        try:
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    **gpu_inputs,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    num_return_sequences=num_beams,
+                    pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                    return_legacy_cache=True,
+                )
+        finally:
+            del gpu_inputs
 
         results = []
         for i in range(num_beams):
@@ -467,6 +425,7 @@ class VLAModel:
             score = outputs.sequences_scores[i].item() if hasattr(outputs, 'sequences_scores') else 0.0
             results.append({"text": gen_text, "score": score})
 
+        del outputs
         return results
 
     def compute_loss(
@@ -580,8 +539,6 @@ class VLAModel:
                 for item in msg["content"]:
                     if isinstance(item, dict) and item.get("type") == "image":
                         item["image"] = image
-                        if "image" in item and item.get("image") == "screenshot_placeholder":
-                            item["image"] = image
         return processed
 
     def save_lora(self, path: str) -> None:

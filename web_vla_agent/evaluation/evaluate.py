@@ -330,18 +330,6 @@ def main():
     parser.add_argument("--split", type=str, default="test_task")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument(
-        "--load-in-4bit",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Load model in 4-bit QLoRA (default: True). "
-            "MUST match training setup — LoRA adapters trained on 4-bit base weights "
-            "produce NaN/inf logits when run on bfloat16 base weights. "
-            "4-bit automatically pins to a single GPU to avoid a PEFT multi-GPU bug. "
-            "Pass --no-load-in-4bit for bfloat16 multi-GPU (only if LoRA was NOT QLoRA-trained)."
-        ),
-    )
     args = parser.parse_args()
 
     from utils.config import load_config
@@ -354,13 +342,8 @@ def main():
     config = load_config(args.config)
     log = get_logger("vla.eval")
 
-    # Load model.
-    # Multi-GPU (device_map="auto"): use bfloat16 (load_in_4bit=False).
-    #   4-bit + PEFT + multi-GPU triggers a CUDA illegal memory access in
-    #   bitsandbytes when PEFT injects LoRA adapters across GPU shards.
-    #   With 2×47 GB GPUs there is plenty of VRAM for bfloat16.
-    # Single-GPU: pass --load-in-4bit if VRAM is tight.
-    model = VLAModel(config=config, device=args.device, load_in_4bit=args.load_in_4bit)
+    # Load model in pure bfloat16 with device_map="auto".
+    model = VLAModel(config=config, device=args.device)
     model.load()
     if args.checkpoint:
         model.load_lora(args.checkpoint)

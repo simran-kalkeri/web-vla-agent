@@ -17,9 +17,6 @@ dependencies = [
     "peft>=0.7",
     "accelerate>=0.25",
 
-    # Quantization
-    "bitsandbytes>=0.41",
-
     # Multimodal
     "Pillow>=10.0",
     "numpy>=1.24",

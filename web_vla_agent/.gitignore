@@ -27,7 +27,6 @@ logs/
 *.jsonl
 
 # Checkpoints & cached data
-checkpoints/
 cached_embeddings/
 *.pt
 *.pth
