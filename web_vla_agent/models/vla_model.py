@@ -75,9 +75,9 @@ class VLAModel:
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"":0},
             trust_remote_code=True,
-            attn_implementation="sdpa",
+            attn_implementation="eager",
         )
 
         # Load processor (handles both text + vision)
