@@ -177,13 +177,20 @@ class ActionDecoder:
         return normalized
 
     def _try_parse(self, text: str) -> Optional[Dict[str, Any]]:
-        """Try to parse text as JSON and validate basic structure."""
+        """Try to parse text as JSON and validate basic structure.
+
+        Accepts both {"action": "CLICK"} and {"type": "click"} formats.
+        The LoRA fine-tuned model may output "type" instead of "action".
+        """
         try:
             obj = json.loads(text)
-            if isinstance(obj, dict) and "action" in obj:
-                # Normalize action type
-                obj["action"] = obj["action"].upper()
-                return obj
+            if isinstance(obj, dict):
+                # Accept "type" as alias for "action" (LoRA model variant)
+                if "type" in obj and "action" not in obj:
+                    obj["action"] = obj.pop("type")
+                if "action" in obj:
+                    obj["action"] = str(obj["action"]).upper()
+                    return obj
         except (json.JSONDecodeError, ValueError):
             pass
         return None
