@@ -57,12 +57,27 @@ class ActionDecoder:
         if action:
             return action
 
+        # Fix mismatched brackets: model outputs ["type": "click", ...}
+        # which is a dict with wrong opening bracket
+        fixed = self._fix_brackets(raw_text)
+        if fixed != raw_text:
+            action = self._try_parse(fixed)
+            if action:
+                return action
+
         # Strip markdown code fences
         cleaned = re.sub(r"```(?:json)?\s*", "", raw_text)
         cleaned = re.sub(r"```", "", cleaned).strip()
         action = self._try_parse(cleaned)
         if action:
             return action
+
+        # Try bracket fix on cleaned text too
+        fixed = self._fix_brackets(cleaned)
+        if fixed != cleaned:
+            action = self._try_parse(fixed)
+            if action:
+                return action
 
         # Find JSON object in text  { ... }
         matches = re.findall(r'\{[^{}]*\}', cleaned, re.DOTALL)
@@ -194,6 +209,26 @@ class ActionDecoder:
         except (json.JSONDecodeError, ValueError):
             pass
         return None
+
+    @staticmethod
+    def _fix_brackets(text: str) -> str:
+        """Fix mismatched brackets from model output.
+
+        The LoRA model sometimes outputs ["type": "click", ...}
+        (starts with [ but contains key:value pairs and ends with }).
+        This fixes it to {"type": "click", ...}.
+        """
+        text = text.strip()
+        # ["key": ...} → {"key": ...}
+        if text.startswith('["') and text.endswith('}'):
+            text = '{' + text[1:]
+        # {"key": ...] → {"key": ...}
+        elif text.startswith('{') and text.endswith(']'):
+            text = text[:-1] + '}'
+        # ["key": ...] with key:value pairs → {...}
+        elif text.startswith('["') and ':' in text and text.endswith(']'):
+            text = '{' + text[1:-1] + '}'
+        return text
 
     @staticmethod
     def action_to_text(action: Dict[str, Any]) -> str:
