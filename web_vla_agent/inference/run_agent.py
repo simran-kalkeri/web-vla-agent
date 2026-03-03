@@ -248,6 +248,7 @@ class VLAAgent:
         latency_ms = (time.time() - start) * 1000
 
         logger.info(f"  Generated: {result['text'][:200]}")
+        print(f"  [DEBUG] Raw model output: {result['text'][:300]}")
         logger.info(f"  Avg log prob: {result.get('avg_log_prob', 0):.3f}")
 
         # Parse and validate
@@ -275,6 +276,8 @@ class VLAAgent:
 
         if not is_valid:
             logger.warning(f"  Invalid action: {error}")
+            print(f"  Invalid action: {error}")
+            print(f"  Raw output was: {result['text'][:200]}")
 
         return {
             "action": action if is_valid else None,
