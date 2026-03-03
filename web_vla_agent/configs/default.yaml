@@ -58,7 +58,7 @@ data:
   max_text_per_node: 200
 
 environment:
-  headless: false
+  headless: true
   viewport_width: 1280
   viewport_height: 720
   timeout_ms: 30000

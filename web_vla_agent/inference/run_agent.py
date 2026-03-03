@@ -126,6 +126,11 @@ class VLAAgent:
             state = await self.env.reset(url)
             self.failure_detector.reset()
             prev_state_dict: dict | None = None
+
+            # Save initial screenshot for debugging
+            if state.screenshot:
+                state.screenshot.save("debug_step_0.png")
+
             logger.info(f"Task: {task}")
             logger.info(f"URL: {url}")
             logger.info(f"Page: {state.page_title}")
@@ -178,6 +183,10 @@ class VLAAgent:
 
                 new_state = await self.env.step(web_action)
                 logger.info(f"  → Page: {new_state.page_title} URL: {new_state.url}")
+
+                # Save step screenshot for debugging
+                if new_state.screenshot:
+                    new_state.screenshot.save(f"debug_step_{step+1}.png")
 
                 # Failure detection
                 curr_state_dict = {
