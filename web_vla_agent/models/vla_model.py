@@ -288,9 +288,10 @@ class VLAModel:
         input_len = gpu_inputs["input_ids"].shape[-1]
         del inputs  # free CPU-side tensors immediately
 
-        # Greedy vs. sampling.
-        do_sample = temperature > 0.01
-        gen_temperature = max(temperature, 0.01) if do_sample else 1.0
+        # Structured JSON decoding: ALWAYS use greedy (no sampling).
+        # Sampling causes format drift (arrays, explanations, etc.).
+        do_sample = False
+        gen_temperature = 1.0
 
         # torch.inference_mode() is stricter than no_grad:
         # - disables autograd graph construction entirely
@@ -299,12 +300,13 @@ class VLAModel:
             with torch.inference_mode():
                 outputs = self.model.generate(
                     **gpu_inputs,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=min(max_new_tokens, 128),
                     temperature=gen_temperature,
                     do_sample=do_sample,
-                    top_p=self.config.model.top_p if do_sample else 1.0,
+                    top_p=1.0,
                     repetition_penalty=self.config.model.repetition_penalty,
                     pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
                     output_scores=return_log_probs,
                     return_dict_in_generate=return_log_probs,
                     use_cache=True,
