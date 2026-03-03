@@ -235,6 +235,14 @@ class VLAAgent:
             extra_context=extra_context,
         )
 
+        # Debug: show what we're feeding the model
+        dom_len = len(state.serialized_dom) if state.serialized_dom else 0
+        num_elements = len(state.dom_elements) if state.dom_elements else 0
+        img_size = state.screenshot.size if state.screenshot else None
+        print(f"  [DEBUG] DOM chars: {dom_len}, DOM elements: {num_elements}, Screenshot: {img_size}")
+        if dom_len < 50:
+            print(f"  [DEBUG] DOM content: {state.serialized_dom!r}")
+
         # Get valid node IDs from current DOM
         valid_ids = [el.get("node_id", -1) for el in state.dom_elements]
 
