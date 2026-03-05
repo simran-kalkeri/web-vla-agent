@@ -10,15 +10,17 @@ model:
   top_p: 0.9
   repetition_penalty: 1.1
 
-  # LoRA configuration
+  # QLoRA configuration
+  use_qlora: true
   lora_r: 16
   lora_alpha: 32
   lora_dropout: 0.05
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  quantization_bits: 4
 
   # Image resolution limits for Qwen2-VL processor (conservative for 48GB GPU)
   image_min_pixels: 43904      # 56 * 28 * 28 — ~150 vision tokens min
-  image_max_pixels: 200000    # 512 * 28 * 28 — ~450 vision tokens max
+  image_max_pixels: 401408     # 512 * 28 * 28 — ~450 vision tokens max
 
   # Action types
   action_types: ["CLICK", "TYPE", "SELECT", "SCROLL"]
@@ -53,8 +55,8 @@ training:
 
 data:
   dataset_name: "osunlp/Multimodal-Mind2Web"
-  max_dom_nodes: 200
-  max_action_history: 2
+  max_dom_nodes: 500
+  max_action_history: 10
   max_text_per_node: 200
 
 environment:

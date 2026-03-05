@@ -20,7 +20,8 @@ class ModelConfig:
     temperature: float = 0.1
     top_p: float = 0.9
     repetition_penalty: float = 1.1
-    # LoRA
+    # QLoRA
+    use_qlora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -28,12 +29,13 @@ class ModelConfig:
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj",
                                   "gate_proj", "up_proj", "down_proj"]
     )
+    quantization_bits: int = 4
     action_types: List[str] = field(
         default_factory=lambda: ["CLICK", "TYPE", "SELECT", "SCROLL"]
     )
     # Image resolution limits for Qwen2-VL processor
-    image_min_pixels: int = 256 * 28 * 28    # 200704
-    image_max_pixels: int = 1280 * 28 * 28   # 1003520
+    image_min_pixels: int = 43904      # 56 * 28 * 28 — ~150 vision tokens min
+    image_max_pixels: int = 401408     # 512 * 28 * 28 — ~450 vision tokens max
 
 
 @dataclass
@@ -43,8 +45,8 @@ class TrainingConfig:
     stage3_epochs: int = 0
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 4
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 8
     warmup_ratio: float = 0.1
     max_grad_norm: float = 1.0
     seed: int = 42
@@ -53,7 +55,7 @@ class TrainingConfig:
     save_every_n_epochs: int = 1
     checkpoint_dir: str = "checkpoints"
     logging_steps: int = 10
-    max_seq_length: int = 4096
+    max_seq_length: int = 2048
 
 
 @dataclass

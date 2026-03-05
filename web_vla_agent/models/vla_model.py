@@ -5,13 +5,13 @@ End-to-end multimodal web agent using Qwen2-VL as backbone.
 All tokens (task, DOM, action history, screenshot patches) fully cross-attend.
 
 Architecture:
-  - Qwen2-VL-2B-Instruct (or 7B) in pure bfloat16 + LoRA adapters
+  - Qwen2-VL-2B-Instruct (or 7B) with optional QLoRA (4-bit quantization)
   - Full vision-language cross-attention (no bi-encoder)
   - Autoregressive JSON action generation
   - Token-level log probability extraction for uncertainty
 
 Stability rules:
-  - No quantization (no bitsandbytes, no triton)
+  - QLoRA via bitsandbytes when config.model.use_qlora is True
   - No manual image resizing (processor handles it)
   - No process_vision_info (direct processor call, matching training)
   - processor.image_processor.min_pixels/max_pixels set to match training
@@ -35,7 +35,8 @@ class VLAModel:
     Multimodal VLA Web Agent backed by Qwen2-VL.
 
     Supports:
-      - GPU inference in pure bfloat16 + LoRA adapters
+      - GPU inference with optional QLoRA (4-bit) or pure bfloat16
+      - LoRA adapters for parameter-efficient fine-tuning
       - Autoregressive JSON action generation
       - Token-level log probability extraction
       - Beam search for uncertainty estimation
@@ -61,23 +62,44 @@ class VLAModel:
         self._is_loaded = False
 
     def load(self) -> None:
-        """Load model, processor, and tokenizer in pure bfloat16."""
+        """Load model, processor, and tokenizer. Uses QLoRA (4-bit) if configured."""
         if self._is_loaded:
             return
 
         model_name = self.config.model.name
-        logger.info(f"Loading {model_name} in bfloat16...")
+        use_qlora = getattr(self.config.model, "use_qlora", False)
+        quant_bits = getattr(self.config.model, "quantization_bits", 4)
 
         from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
-        # Load model — pure bfloat16, no quantization.
-        # device_map="auto" shards across available GPUs.
+        # Build model loading kwargs
+        model_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "device_map": {"": 0},
+            "trust_remote_code": True,
+            "attn_implementation": "eager",
+        }
+
+        if use_qlora:
+            from transformers import BitsAndBytesConfig
+
+            logger.info(
+                f"Loading {model_name} with QLoRA ({quant_bits}-bit quantization)..."
+            )
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=(quant_bits == 4),
+                load_in_8bit=(quant_bits == 8),
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            model_kwargs["quantization_config"] = bnb_config
+        else:
+            logger.info(f"Loading {model_name} in pure bfloat16 (no quantization)...")
+
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"":0},
-            trust_remote_code=True,
-            attn_implementation="eager",
+            **model_kwargs,
         )
 
         # Load processor (handles both text + vision)
@@ -135,6 +157,13 @@ class VLAModel:
             self.load()
 
         from peft import LoraConfig, get_peft_model
+
+        # Prepare model for quantized training if QLoRA is active
+        use_qlora = getattr(self.config.model, "use_qlora", False)
+        if use_qlora:
+            from peft import prepare_model_for_kbit_training
+            self.model = prepare_model_for_kbit_training(self.model)
+            logger.info("Model prepared for QLoRA k-bit training")
 
         # Build target modules list — include vision merger layers
         target_modules = list(self.config.model.lora_target_modules)
