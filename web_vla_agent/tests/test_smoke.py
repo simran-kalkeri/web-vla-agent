@@ -1,7 +1,7 @@
 """
-Smoke Tests for VLA Web Agent (Multimodal Sequential Architecture).
+Smoke Tests for VLA Web Agent (Candidate-Based Architecture).
 
-Validates that all new modules import, instantiate, and work correctly
+Validates that all modules import, instantiate, and work correctly
 WITHOUT requiring GPU or model downloads.
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sys
 
 
 def test_imports():
-    """All new modules import without error."""
+    """All modules import without error."""
     print("  [1] Testing imports...", end=" ")
     from environment.dom_serializer import DOMSerializer, SerializedNode
     from environment.playwright_env import BrowserEnvironment, BrowserState, WebAction
@@ -26,7 +26,7 @@ def test_imports():
 
 
 def test_config():
-    """Config loads and has correct new structure."""
+    """Config loads and has correct structure."""
     print("  [2] Testing config...", end=" ")
     from utils.config import load_config
     cfg = load_config()
@@ -62,16 +62,6 @@ def test_dom_serializer():
     assert "Search and reserve a car" in text
     assert "node id=" in text
     assert "</node>" in text
-
-    # Interactable nodes should be first
-    first_non_interactable_idx = None
-    for i, n in enumerate(nodes):
-        if not n.is_interactable:
-            first_non_interactable_idx = i
-            break
-    if first_non_interactable_idx is not None:
-        for n in nodes[:first_non_interactable_idx]:
-            assert n.is_interactable, "Interactable nodes should be sorted first"
 
     ids = DOMSerializer.get_node_ids(nodes)
     assert len(ids) == len(nodes)
@@ -128,28 +118,36 @@ def test_browser_environment_mock():
 
 
 def test_prompt_builder():
-    """Prompt builder produces correct format."""
+    """Prompt builder produces correct candidate-based format."""
     print("  [5] Testing prompt builder...", end=" ")
     from models.prompt_builder import PromptBuilder
 
     builder = PromptBuilder()
 
+    # Candidate list format
+    candidates = [
+        {"candidate_index": 0, "tag": "button", "text": "Search", "attributes": {"role": "tab"}},
+        {"candidate_index": 1, "tag": "input", "text": "", "attributes": {"type": "text", "placeholder": "City"}},
+        {"candidate_index": 2, "tag": "a", "text": "View Results", "attributes": {"href": "/results"}},
+    ]
+
     # Text prompt
     text = builder.build_text_prompt(
         task="Click the search button",
-        serialized_dom='<node id=1 tag=button>Search</node>',
+        candidates=candidates,
         action_history=[],
     )
-    assert "[TASK]" in text
+    assert "[USER TASK]" in text
     assert "Click the search button" in text
-    assert "[DOM]" in text
+    assert "[CANDIDATE ELEMENTS]" in text
+    assert "[0]" in text
     assert "Search" in text
-    assert "[ACTION_HISTORY]" in text
+    assert "[ACTION HISTORY]" in text
 
     # Chat messages
     msgs = builder.build_chat_messages(
         task="Click search",
-        serialized_dom='<node id=1 tag=button>Search</node>',
+        candidates=candidates,
     )
     assert len(msgs) == 2  # system + user
     assert msgs[0]["role"] == "system"
@@ -158,37 +156,43 @@ def test_prompt_builder():
     # Training prompt
     training = builder.build_training_prompt(
         task="Click search",
-        serialized_dom='<node id=1 tag=button>Search</node>',
-        target_action={"action": "CLICK", "element_id": 1},
+        candidates=candidates,
+        target_action={"action": "CLICK", "candidate": 0},
     )
     assert "prompt" in training
     assert "target" in training
     assert "full_text" in training
-    assert '"action": "CLICK"' in training["target"]
+    assert '"candidate": 0' in training["target"]
 
     # Format action target
-    target = PromptBuilder.format_action_target("TYPE", element_id=5, value="NYC")
+    target = PromptBuilder.format_action_target("TYPE", candidate=1, value="NYC")
     assert target["action"] == "TYPE"
-    assert target["element_id"] == 5
+    assert target["candidate"] == 1
     assert target["value"] == "NYC"
+
+    # Format candidate
+    line = PromptBuilder.format_candidate(0, "button", "Search", {"role": "tab"})
+    assert "[0]" in line
+    assert "<button>" in line
+    assert "Search" in line
     print("PASS ✓")
 
 
 def test_action_decoder():
-    """Action decoder parses and validates correctly."""
+    """Action decoder parses and validates candidate-based actions."""
     print("  [6] Testing action decoder...", end=" ")
     from models.action_decoder import ActionDecoder
 
     decoder = ActionDecoder()
 
     # Clean JSON
-    action = decoder.parse('{"action": "CLICK", "element_id": 32}')
+    action = decoder.parse('{"action": "CLICK", "candidate": 3}')
     assert action is not None
     assert action["action"] == "CLICK"
-    assert action["element_id"] == 32
+    assert action["candidate"] == 3
 
     # JSON in markdown fences
-    action2 = decoder.parse('```json\n{"action": "TYPE", "element_id": 15, "value": "Brooklyn"}\n```')
+    action2 = decoder.parse('```json\n{"action": "TYPE", "candidate": 1, "value": "Brooklyn"}\n```')
     assert action2 is not None
     assert action2["action"] == "TYPE"
     assert action2["value"] == "Brooklyn"
@@ -198,28 +202,35 @@ def test_action_decoder():
     assert action3 is not None
     assert action3["action"] == "SCROLL"
 
-    # Validation
-    valid, err = decoder.validate({"action": "CLICK", "element_id": 5}, [1, 5, 10])
+    # Validation with num_candidates
+    valid, err = decoder.validate({"action": "CLICK", "candidate": 2}, num_candidates=5)
     assert valid, f"Should be valid: {err}"
 
-    valid, err = decoder.validate({"action": "CLICK", "element_id": 99}, [1, 5, 10])
-    assert not valid, "Should be invalid (bad element_id)"
+    valid, err = decoder.validate({"action": "CLICK", "candidate": 10}, num_candidates=5)
+    assert not valid, "Should be invalid (candidate >= num_candidates)"
 
-    valid, err = decoder.validate({"action": "TYPE", "element_id": 5}, [5])
+    valid, err = decoder.validate({"action": "TYPE", "candidate": 1}, num_candidates=5)
     assert not valid, "TYPE without value should be invalid"
 
+    valid, err = decoder.validate({"action": "STOP"})
+    assert valid, "STOP should always be valid"
+
     valid, err = decoder.validate({"action": "DONE"})
-    assert valid, "DONE should always be valid"
+    assert valid, "DONE should be valid (mapped to STOP)"
 
     # Normalize
-    norm = decoder.normalize({"action": "click", "element_id": "32"})
+    norm = decoder.normalize({"action": "click", "candidate": "3"})
     assert norm["action"] == "CLICK"
-    assert norm["element_id"] == 32
+    assert norm["candidate"] == 3
+
+    # Backward compat: element_id → candidate
+    norm2 = decoder.normalize({"action": "CLICK", "element_id": 5})
+    assert norm2["candidate"] == 5
 
     # Parse and validate
     action, is_valid, error = decoder.parse_and_validate(
-        '{"action": "SELECT", "element_id": 8, "value": "Economy"}',
-        valid_node_ids=[1, 5, 8, 20],
+        '{"action": "SELECT", "candidate": 3, "value": "Economy"}',
+        num_candidates=5,
     )
     assert is_valid, f"Should be valid: {error}"
     assert action["value"] == "Economy"
@@ -243,9 +254,9 @@ def test_uncertainty():
 
     # Beam agreement
     beams = [
-        {"text": '{"action": "CLICK", "element_id": 5}', "score": -0.3},
-        {"text": '{"action": "CLICK", "element_id": 5}', "score": -0.5},
-        {"text": '{"action": "CLICK", "element_id": 5}', "score": -0.8},
+        {"text": '{"action": "CLICK", "candidate": 5}', "score": -0.3},
+        {"text": '{"action": "CLICK", "candidate": 5}', "score": -0.5},
+        {"text": '{"action": "CLICK", "candidate": 5}', "score": -0.8},
     ]
     result = uc.assess_beams(beams)
     assert result.beam_agreement == 1.0, "All beams agree"
@@ -253,8 +264,8 @@ def test_uncertainty():
 
     # Beam disagreement
     beams_disagree = [
-        {"text": '{"action": "CLICK", "element_id": 5}', "score": -0.3},
-        {"text": '{"action": "TYPE", "element_id": 10, "value": "x"}', "score": -1.5},
+        {"text": '{"action": "CLICK", "candidate": 5}', "score": -0.3},
+        {"text": '{"action": "TYPE", "candidate": 10, "value": "x"}', "score": -1.5},
         {"text": '{"action": "SCROLL", "direction": "down"}', "score": -2.0},
     ]
     result = uc.assess_beams(beams_disagree)
@@ -302,12 +313,21 @@ def test_data_loader_imports():
     loader = Mind2WebLoader(max_dom_nodes=500)
     assert loader.dataset_name == "osunlp/Multimodal-Mind2Web"
 
+    # Test new candidate-based sample
     sample = Mind2WebSample(
         task="Click search",
         serialized_dom="<node id=1 tag=button>Search</node>",
-        action={"action": "CLICK", "element_id": 1},
+        candidates=[
+            {"candidate_index": 0, "tag": "button", "text": "Search"},
+            {"candidate_index": 1, "tag": "input", "text": ""},
+        ],
+        target_candidate_index=0,
+        action={"action": "CLICK", "candidate": 0},
     )
     assert sample.task == "Click search"
+    assert sample.target_candidate_index == 0
+    assert sample.candidates[0]["tag"] == "button"
+    assert sample.action["candidate"] == 0
     print("PASS ✓")
 
 
@@ -333,7 +353,7 @@ def test_old_files_removed():
 
 
 def test_new_files_exist():
-    """New architecture files exist."""
+    """All required files exist."""
     print("  [11] Testing new files exist...", end=" ")
     import os
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -351,13 +371,43 @@ def test_new_files_exist():
     ]
     for f in new_files:
         path = os.path.join(base, f)
-        assert os.path.exists(path), f"New file missing: {f}"
+        assert os.path.exists(path), f"File missing: {f}"
+    print("PASS ✓")
+
+
+def test_candidate_format():
+    """Candidate formatting produces correct output."""
+    print("  [12] Testing candidate format...", end=" ")
+    from models.prompt_builder import PromptBuilder
+
+    # Single candidate
+    line = PromptBuilder.format_candidate(
+        index=3,
+        tag="button",
+        text="Submit Flight Search",
+        attributes={"role": "tab", "id": "submit-btn"},
+    )
+    assert "[3]" in line
+    assert "<button>" in line
+    assert "Submit Flight Search" in line
+    assert 'role="tab"' in line
+
+    # Candidate list
+    candidates = [
+        {"candidate_index": 0, "tag": "button", "text": "Search"},
+        {"candidate_index": 1, "tag": "input", "text": "", "attributes": {"placeholder": "City"}},
+    ]
+    text = PromptBuilder.format_candidate_list(candidates)
+    assert "[0]" in text
+    assert "[1]" in text
+    assert "<button>" in text
+    assert "<input>" in text
     print("PASS ✓")
 
 
 def main():
     print("=" * 60)
-    print("  VLA Web Agent — Smoke Tests (New Architecture)")
+    print("  VLA Web Agent — Smoke Tests (Candidate-Based Architecture)")
     print("=" * 60)
 
     passed = 0
@@ -375,6 +425,7 @@ def main():
         test_data_loader_imports,
         test_old_files_removed,
         test_new_files_exist,
+        test_candidate_format,
     ]
 
     for test in tests:

@@ -1,18 +1,18 @@
 """
-Action Decoder — Parse and Validate Generated JSON Actions.
+Action Decoder — Parse and Validate Generated JSON Actions (Candidate-Based).
 
 Handles:
   - Robust JSON parsing from model output (handles markdown fences, etc.)
-  - Action validation against DOM node IDs
+  - Action validation against candidate indices
   - Constrained action type checking
-  - Value validation for TYPE/SELECT/SCROLL
 
-Action format:
-  {"action": "CLICK", "element_id": 32}
-  {"action": "TYPE", "element_id": 15, "value": "Brooklyn"}
-  {"action": "SELECT", "element_id": 8, "value": "Economy"}
+Expected formats:
+  {"action": "CLICK", "candidate": 3}
+  {"action": "TYPE", "candidate": 0, "value": "Brooklyn"}
+  {"action": "SELECT", "candidate": 8, "value": "Economy"}
   {"action": "SCROLL", "direction": "down", "amount": 300}
-  {"action": "DONE"}
+  {"action": "SCROLL"}
+  {"action": "STOP"}
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
-VALID_ACTIONS = {"CLICK", "TYPE", "SELECT", "SCROLL", "DONE"}
+VALID_ACTIONS = {"CLICK", "TYPE", "SELECT", "SCROLL", "STOP", "DONE"}
 
 
 class ActionDecoder:
@@ -29,7 +29,7 @@ class ActionDecoder:
     Parse and validate model-generated action JSON.
 
     Provides robust parsing with fallbacks and validation
-    against the current DOM state.
+    against the candidate list.
     """
 
     def __init__(self, valid_actions: Optional[set] = None):
@@ -50,111 +50,105 @@ class ActionDecoder:
         if not raw_text or not raw_text.strip():
             return None
 
-        raw_text = raw_text.strip()
+        text = raw_text.strip()
 
-        # Try direct JSON parse first
-        action = self._try_parse(raw_text)
-        if action:
-            return action
+        # 1. Try direct parse
+        result = self._try_parse(text)
+        if result:
+            return result
 
-        # Fix mismatched brackets: model outputs ["type": "click", ...}
-        # which is a dict with wrong opening bracket
-        fixed = self._fix_brackets(raw_text)
-        if fixed != raw_text:
-            action = self._try_parse(fixed)
-            if action:
-                return action
+        # 2. Try extracting from markdown code fences
+        fence_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+        fences = re.findall(fence_pattern, text, re.DOTALL)
+        for fence in fences:
+            result = self._try_parse(fence.strip())
+            if result:
+                return result
 
-        # Strip markdown code fences
-        cleaned = re.sub(r"```(?:json)?\s*", "", raw_text)
-        cleaned = re.sub(r"```", "", cleaned).strip()
-        action = self._try_parse(cleaned)
-        if action:
-            return action
-
-        # Try bracket fix on cleaned text too
-        fixed = self._fix_brackets(cleaned)
-        if fixed != cleaned:
-            action = self._try_parse(fixed)
-            if action:
-                return action
-
-        # Find JSON object in text  { ... }
-        matches = re.findall(r'\{[^{}]*\}', cleaned, re.DOTALL)
+        # 3. Try extracting JSON-like patterns
+        json_pattern = r'\{[^{}]*\}'
+        matches = re.findall(json_pattern, text)
         for match in matches:
-            action = self._try_parse(match)
-            if action:
-                return action
+            result = self._try_parse(match)
+            if result:
+                return result
 
-        # Try to find nested JSON (with inner braces)
-        matches = re.findall(r'\{[^}]*(?:\{[^}]*\}[^}]*)?\}', cleaned, re.DOTALL)
-        for match in matches:
-            action = self._try_parse(match)
-            if action:
-                return action
+        # 4. Try fixing brackets
+        fixed = self._fix_brackets(text)
+        if fixed != text:
+            result = self._try_parse(fixed)
+            if result:
+                return result
 
         return None
 
     def validate(
         self,
         action: Dict[str, Any],
-        valid_node_ids: Optional[List[int]] = None,
+        num_candidates: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """
         Validate a parsed action.
 
+        Parameters
+        ----------
+        action : dict
+            Parsed action dict.
+        num_candidates : int, optional
+            Number of valid candidates. If provided, validates candidate index.
+
         Returns (is_valid, error_message).
         """
-        if not action:
-            return False, "Empty action"
-
-        # Check action type
         action_type = action.get("action", "").upper()
+
+        # Normalize: accept "DONE" as "STOP"
+        if action_type == "DONE":
+            action_type = "STOP"
+            action["action"] = "STOP"
+
         if action_type not in self.valid_actions:
             return False, f"Invalid action type: {action_type}"
 
-        # DONE action needs no further validation
-        if action_type == "DONE":
+        # STOP/SCROLL don't need a candidate
+        if action_type in ("STOP", "DONE", "SCROLL"):
             return True, ""
 
-        # SCROLL doesn't require element_id
-        if action_type == "SCROLL":
-            direction = action.get("direction", "down")
-            if direction not in ("up", "down"):
-                return False, f"Invalid scroll direction: {direction}"
-            return True, ""
+        # CLICK, TYPE, SELECT need a candidate
+        candidate = action.get("candidate")
+        if candidate is None:
+            # Backward compat: try element_id
+            candidate = action.get("element_id")
+            if candidate is not None:
+                action["candidate"] = candidate
 
-        # CLICK, TYPE, SELECT require element_id
-        element_id = action.get("element_id")
-        if element_id is None:
-            return False, f"{action_type} requires element_id"
+        if candidate is None:
+            return False, "Missing candidate index"
 
         try:
-            element_id = int(element_id)
+            candidate = int(candidate)
+            action["candidate"] = candidate
         except (ValueError, TypeError):
-            return False, f"Invalid element_id: {element_id}"
+            return False, f"Invalid candidate index: {candidate}"
 
-        # Check against valid node IDs
-        if valid_node_ids is not None and element_id not in valid_node_ids:
-            return False, f"element_id {element_id} not in DOM"
+        if candidate < 0:
+            return False, f"Candidate index {candidate} is negative"
 
-        # TYPE and SELECT require value
-        if action_type == "TYPE":
-            value = action.get("value", "")
-            if not value:
-                return False, "TYPE action requires a value"
+        if num_candidates is not None and candidate >= num_candidates:
+            return False, f"Candidate index {candidate} >= num_candidates ({num_candidates})"
 
-        if action_type == "SELECT":
-            value = action.get("value", "")
-            if not value:
-                return False, "SELECT action requires a value"
+        # TYPE/SELECT need value
+        if action_type == "TYPE" and not action.get("value"):
+            return False, "TYPE action missing value"
+
+        if action_type == "SELECT" and not action.get("value"):
+            return False, "SELECT action missing value"
 
         return True, ""
 
     def parse_and_validate(
         self,
         raw_text: str,
-        valid_node_ids: Optional[List[int]] = None,
+        num_candidates: Optional[int] = None,
     ) -> Tuple[Optional[Dict[str, Any]], bool, str]:
         """
         Parse and validate in one call.
@@ -163,50 +157,61 @@ class ActionDecoder:
         """
         action = self.parse(raw_text)
         if action is None:
-            return None, False, "Failed to parse JSON from model output"
+            return None, False, "Failed to parse JSON"
 
-        is_valid, error = self.validate(action, valid_node_ids)
+        action = self.normalize(action)
+        is_valid, error = self.validate(action, num_candidates)
         return action, is_valid, error
 
     def normalize(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """
         Normalize action dict to canonical form.
         """
-        normalized: Dict[str, Any] = {
-            "action": action.get("action", "CLICK").upper(),
-        }
+        result = dict(action)
 
-        action_type = normalized["action"]
+        # Normalize action type
+        action_type = result.get("action", "")
+        if not action_type:
+            action_type = result.get("type", "")
+        result["action"] = action_type.upper()
 
-        if action_type in ("CLICK", "TYPE", "SELECT"):
-            normalized["element_id"] = int(action.get("element_id", -1))
+        # Handle DONE → STOP
+        if result["action"] == "DONE":
+            result["action"] = "STOP"
 
-        if action_type == "TYPE":
-            normalized["value"] = str(action.get("value", ""))
-        elif action_type == "SELECT":
-            normalized["value"] = str(action.get("value", ""))
-        elif action_type == "SCROLL":
-            normalized["direction"] = action.get("direction", "down")
-            normalized["amount"] = int(action.get("amount", 300))
+        # Normalize candidate: accept both "candidate" and "element_id"
+        if "candidate" in result:
+            try:
+                result["candidate"] = int(result["candidate"])
+            except (ValueError, TypeError):
+                pass
+        elif "element_id" in result:
+            try:
+                result["candidate"] = int(result["element_id"])
+            except (ValueError, TypeError):
+                pass
 
-        return normalized
+        # Remove element_id if we have candidate
+        if "candidate" in result and "element_id" in result:
+            del result["element_id"]
+
+        return result
 
     def _try_parse(self, text: str) -> Optional[Dict[str, Any]]:
         """Try to parse text as JSON and validate basic structure.
 
-        Accepts both {"action": "CLICK"} and {"type": "click"} formats.
-        The LoRA fine-tuned model may output "type" instead of "action".
+        Accepts {"action": "CLICK", "candidate": 3} and
+        {"type": "click", "candidate": 3} formats.
         """
         try:
-            obj = json.loads(text)
-            if isinstance(obj, dict):
-                # Accept "type" as alias for "action" (LoRA model variant)
-                if "type" in obj and "action" not in obj:
-                    obj["action"] = obj.pop("type")
-                if "action" in obj:
-                    obj["action"] = str(obj["action"]).upper()
-                    return obj
-        except (json.JSONDecodeError, ValueError):
+            # Fix bracket issues first
+            fixed = self._fix_brackets(text)
+            data = json.loads(fixed)
+            if isinstance(data, dict):
+                # Must have "action" or "type" key
+                if "action" in data or "type" in data:
+                    return data
+        except json.JSONDecodeError:
             pass
         return None
 
@@ -219,29 +224,35 @@ class ActionDecoder:
         This fixes it to {"type": "click", ...}.
         """
         text = text.strip()
-        # ["key": ...} → {"key": ...}
-        if text.startswith('["') and text.endswith('}'):
-            text = '{' + text[1:]
-        # {"key": ...] → {"key": ...}
-        elif text.startswith('{') and text.endswith(']'):
-            text = text[:-1] + '}'
-        # ["key": ...] with key:value pairs → {...}
-        elif text.startswith('["') and ':' in text and text.endswith(']'):
-            text = '{' + text[1:-1] + '}'
+        if not text:
+            return text
+
+        # Fix [{ → {
+        if text.startswith("[") and ":" in text:
+            text = "{" + text[1:]
+
+        # Fix }] → }
+        if text.endswith("]") and ":" in text:
+            text = text[:-1] + "}"
+
         return text
 
     @staticmethod
     def action_to_text(action: Dict[str, Any]) -> str:
         """Convert action dict to human-readable text."""
-        a = action.get("action", "?")
-        if a == "CLICK":
-            return f"CLICK element_id={action.get('element_id', '?')}"
-        elif a == "TYPE":
-            return f"TYPE element_id={action.get('element_id', '?')} value=\"{action.get('value', '')}\""
-        elif a == "SELECT":
-            return f"SELECT element_id={action.get('element_id', '?')} value=\"{action.get('value', '')}\""
-        elif a == "SCROLL":
-            return f"SCROLL direction={action.get('direction', 'down')} amount={action.get('amount', 300)}"
-        elif a == "DONE":
-            return "DONE"
-        return f"UNKNOWN: {json.dumps(action)}"
+        action_type = action.get("action", "UNKNOWN")
+        candidate = action.get("candidate", "?")
+
+        if action_type == "CLICK":
+            return f"CLICK candidate={candidate}"
+        elif action_type == "TYPE":
+            return f'TYPE candidate={candidate} value="{action.get("value", "")}"'
+        elif action_type == "SELECT":
+            return f'SELECT candidate={candidate} value="{action.get("value", "")}"'
+        elif action_type == "SCROLL":
+            direction = action.get("direction", "down")
+            amount = action.get("amount", 300)
+            return f"SCROLL direction={direction} amount={amount}"
+        elif action_type in ("STOP", "DONE"):
+            return "STOP"
+        return f"{action_type} candidate={candidate}"

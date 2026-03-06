@@ -1,45 +1,174 @@
 """
-Prompt Builder for VLA Web Agent.
+Prompt Builder for VLA Web Agent — Candidate-Based.
 
 Constructs multimodal prompts for the Qwen2-VL backbone:
-  [SYSTEM] → agent role
-  [TASK] → user instruction
-  [DOM] → serialized DOM tokens (structured, not flat)
-  [ACTION_HISTORY] → previous actions
-  [IMAGE] → screenshot (via vision processor)
+  [SYSTEM] → agent role + action space + grounding rules
+  [USER]   → task + candidate list + action history + screenshot
 
 The model generates JSON action as output:
-  {"action": "CLICK", "element_id": 32}
-  {"action": "TYPE", "element_id": 15, "value": "Brooklyn"}
-  {"action": "SCROLL", "direction": "down", "amount": 300}
-  {"action": "SELECT", "element_id": 8, "value": "Economy"}
+  {"action": "CLICK", "candidate": 3}
+  {"action": "TYPE", "candidate": 0, "value": "Brooklyn"}
+  {"action": "SCROLL"}
+  {"action": "SELECT", "candidate": 8, "value": "Economy"}
+  {"action": "STOP"}
+
+Candidate-based approach:
+  - Each candidate maps to a real DOM element
+  - candidate_index is always a small sequential integer (0, 1, 2, ...)
+  - The model picks a candidate index, then the system maps it to the DOM node
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, List, Optional, Tuple
 
 
 SYSTEM_PROMPT = """\
-You are a web navigation agent.
+You are a precise and deterministic web automation agent. Your job is to complete a user task by interacting with elements on a web page.
 
-You MUST output EXACTLY ONE valid JSON object.
+You are given:
 
-Allowed formats:
-{"action": "CLICK", "element_id": <int>}
-{"action": "TYPE", "element_id": <int>, "value": "<text>"}
-{"action": "SELECT", "element_id": <int>, "value": "<text>"}
-{"action": "SCROLL", "direction": "up|down", "amount": <int>}
-{"action": "DONE"}
+1. The USER TASK
+2. A list of DOM CANDIDATE ELEMENTS extracted from the webpage
+3. The ACTION HISTORY
+
+Each candidate element corresponds to a real element on the webpage.
+
+Your job is to choose the correct element and perform the correct action.
+
+---
+
+## CRITICAL GROUNDING RULES
+
+You MUST only interact with elements listed in the CANDIDATE list.
+
+Each candidate is mapped to a real DOM node.
+
+Each candidate has:
+
+candidate_index → node_id → real webpage element
+
+You must NEVER invent a candidate_index.
+
+If you choose candidate = N, the system will map it to the corresponding DOM node automatically.
+
+Valid candidate values are ONLY those listed in the candidate list.
+
+---
+
+## ACTION SPACE
+
+You may output only one of the following actions:
+
+CLICK
+TYPE
+SELECT
+SCROLL
+STOP
 
 Rules:
-- Output ONLY JSON.
-- Do NOT output arrays.
-- Do NOT output text explanations.
-- Do NOT wrap in markdown.
-- Do NOT output anything before or after the JSON.
-- The entire response must be a single JSON object starting with { and ending with }.
-- element_id must match a node id from the DOM.
-- Choose the action that best progresses toward the task goal.
+
+CLICK
+Click a clickable element (buttons, links, checkboxes, etc.)
+
+TYPE
+Enter text into an input field.
+
+TYPE must include a "value" field.
+
+Example:
+{"action":"TYPE","candidate":0,"value":"New York"}
+
+SELECT
+Choose an option in a dropdown element.
+
+Example:
+{"action":"SELECT","candidate":3,"value":"Economy"}
+
+SCROLL
+Scroll the page if the needed element is not visible.
+
+STOP
+Return STOP only when the task is complete.
+
+---
+
+## ELEMENT SELECTION STRATEGY
+
+To choose the correct candidate:
+
+1. Read the USER TASK carefully.
+2. Identify which element is required to progress toward the task.
+3. Compare the task with each candidate's:
+
+   * text
+   * tag
+   * attributes
+4. Select the candidate that best matches the intended action.
+
+Prefer elements with tags:
+
+input
+button
+select
+a
+
+Do NOT click decorative or container elements like div unless necessary.
+
+---
+
+## STRICT OUTPUT FORMAT
+
+You must output ONLY valid JSON.
+
+DO NOT output explanations.
+
+DO NOT output multiple actions.
+
+Correct format examples:
+
+{"action":"CLICK","candidate":2}
+
+{"action":"TYPE","candidate":0,"value":"New York"}
+
+{"action":"SELECT","candidate":3,"value":"Economy"}
+
+{"action":"SCROLL"}
+
+{"action":"STOP"}
+
+---
+
+## INVALID OUTPUTS
+
+The following are NOT allowed:
+
+* Missing candidate index
+* Outputting text outside JSON
+* Multiple actions
+* Invalid candidate index
+
+---
+
+## ERROR PREVENTION
+
+If no candidate clearly matches the task:
+
+Use SCROLL instead of guessing.
+
+Never produce invalid candidate indices.
+
+Never output candidate = -1.
+
+---
+
+## OBJECTIVE
+
+Your goal is to select the correct candidate element and perform the correct action to complete the task efficiently.
+
+Always choose the action that most directly advances the task.
+
+Return exactly ONE JSON action.\
 """
 
 
@@ -47,24 +176,76 @@ class PromptBuilder:
     """
     Build multimodal prompts for the VLA model.
 
-    Handles text prompt construction. Screenshot encoding is done
-    separately by the model's vision processor.
+    Uses candidate-based format: the model picks a candidate index
+    from a numbered list of DOM elements.
     """
 
     def __init__(
         self,
         system_prompt: str = SYSTEM_PROMPT,
-        max_dom_chars: int = 12000,
+        max_candidates: int = 50,
         max_history_entries: int = 10,
     ):
         self.system_prompt = system_prompt
-        self.max_dom_chars = max_dom_chars
+        self.max_candidates = max_candidates
         self.max_history_entries = max_history_entries
+
+    # ── Candidate formatting ──────────────────────────────────
+
+    @staticmethod
+    def format_candidate(
+        index: int,
+        tag: str,
+        text: str = "",
+        attributes: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Format a single candidate element for the prompt.
+
+        Example output:
+            [3] <button> "Search Flights" role=tab id=search-btn
+        """
+        attrs = attributes or {}
+        # Keep only useful attributes
+        keep = {"role", "type", "placeholder", "aria-label", "href",
+                "name", "value", "title", "alt", "id", "class", "for"}
+        attr_parts = []
+        for k, v in sorted(attrs.items()):
+            if k in keep and v:
+                attr_parts.append(f'{k}="{str(v)[:60]}"')
+        attr_str = " ".join(attr_parts)
+
+        text_str = f' "{text[:80]}"' if text else ""
+        return f"[{index}] <{tag}>{text_str} {attr_str}".strip()
+
+    @staticmethod
+    def format_candidate_list(candidates: List[Dict[str, Any]]) -> str:
+        """
+        Format a list of candidate elements for the prompt.
+
+        Each candidate dict should have:
+          - candidate_index: int
+          - tag: str
+          - text: str (optional)
+          - attributes: dict (optional)
+        """
+        lines = []
+        for c in candidates:
+            line = PromptBuilder.format_candidate(
+                index=c["candidate_index"],
+                tag=c.get("tag", "div"),
+                text=c.get("text", ""),
+                attributes=c.get("attributes"),
+            )
+            lines.append(line)
+        return "\n".join(lines)
+
+    # ── Text prompt ───────────────────────────────────────────
 
     def build_text_prompt(
         self,
         task: str,
-        serialized_dom: str,
+        candidates: List[Dict[str, Any]],
         action_history: Optional[List[Dict[str, Any]]] = None,
         extra_context: str = "",
     ) -> str:
@@ -75,22 +256,17 @@ class PromptBuilder:
         ----------
         task : str
             User's task instruction.
-        serialized_dom : str
-            Structured DOM serialization from DOMSerializer.
+        candidates : list of dicts
+            Candidate elements with candidate_index, tag, text, attributes.
         action_history : list of dicts, optional
             Previous actions taken.
         extra_context : str, optional
             Additional context (e.g., current URL, page title).
-
-        Returns
-        -------
-        str
-            Complete text prompt for the model.
         """
         parts = []
 
         # Task instruction
-        parts.append(f"[TASK]\n{task}\n")
+        parts.append(f"[USER TASK]\n{task}\n")
 
         # Extra context
         if extra_context:
@@ -99,25 +275,26 @@ class PromptBuilder:
         # Action history
         if action_history:
             history_text = self._format_history(action_history)
-            parts.append(f"[ACTION_HISTORY]\n{history_text}\n")
+            parts.append(f"[ACTION HISTORY]\n{history_text}\n")
         else:
-            parts.append("[ACTION_HISTORY]\nNo previous actions.\n")
+            parts.append("[ACTION HISTORY]\nNo previous actions.\n")
 
-        # DOM (may be truncated)
-        dom_text = serialized_dom[:self.max_dom_chars]
-        if len(serialized_dom) > self.max_dom_chars:
-            dom_text += "\n... (DOM truncated)"
-        parts.append(f"[DOM]\n{dom_text}\n")
+        # Candidate elements
+        truncated = candidates[:self.max_candidates]
+        candidates_text = self.format_candidate_list(truncated)
+        parts.append(f"[CANDIDATE ELEMENTS]\n{candidates_text}\n")
 
-        # Instruction to generate action
-        parts.append("[ACTION]\nGenerate the next action as a JSON object:")
+        # Instruction
+        parts.append("[ACTION]\nChoose the correct candidate and action. Output exactly ONE JSON object:")
 
         return "\n".join(parts)
+
+    # ── Chat messages ─────────────────────────────────────────
 
     def build_chat_messages(
         self,
         task: str,
-        serialized_dom: str,
+        candidates: List[Dict[str, Any]],
         action_history: Optional[List[Dict[str, Any]]] = None,
         screenshot_placeholder: bool = True,
         extra_context: str = "",
@@ -126,12 +303,10 @@ class PromptBuilder:
         Build chat-format messages for Qwen2-VL.
 
         Returns list of message dicts compatible with the chat template.
-        The screenshot is represented as an image placeholder that
-        the model processor will fill in.
         """
         user_content = []
 
-        # Add screenshot placeholder (will be replaced by actual image)
+        # Add screenshot placeholder
         if screenshot_placeholder:
             user_content.append({
                 "type": "image",
@@ -141,7 +316,7 @@ class PromptBuilder:
         # Add text prompt
         text_prompt = self.build_text_prompt(
             task=task,
-            serialized_dom=serialized_dom,
+            candidates=candidates,
             action_history=action_history,
             extra_context=extra_context,
         )
@@ -157,10 +332,12 @@ class PromptBuilder:
 
         return messages
 
+    # ── Training prompts ──────────────────────────────────────
+
     def build_training_prompt(
         self,
         task: str,
-        serialized_dom: str,
+        candidates: List[Dict[str, Any]],
         target_action: Dict[str, Any],
         action_history: Optional[List[Dict[str, Any]]] = None,
         extra_context: str = "",
@@ -168,18 +345,14 @@ class PromptBuilder:
         """
         Build a training example with prompt + target.
 
-        Returns
-        -------
-        dict with keys:
+        Returns dict with:
           - "prompt": the input text
           - "target": the target action JSON string
-          - "full_text": prompt + target (for causal LM training)
+          - "full_text": prompt + target
         """
-        import json
-
         prompt = self.build_text_prompt(
             task=task,
-            serialized_dom=serialized_dom,
+            candidates=candidates,
             action_history=action_history,
             extra_context=extra_context,
         )
@@ -194,7 +367,7 @@ class PromptBuilder:
     def build_training_messages(
         self,
         task: str,
-        serialized_dom: str,
+        candidates: List[Dict[str, Any]],
         target_action: Dict[str, Any],
         screenshot: Optional[Any] = None,
         action_history: Optional[List[Dict[str, Any]]] = None,
@@ -204,20 +377,13 @@ class PromptBuilder:
         Build Qwen2-VL chat messages for multimodal training.
 
         Returns a dict with:
-          - "messages_with_target": full conversation including assistant
-            target (for full tokenization and label masking)
+          - "messages_with_target": full conversation including assistant target
           - "messages_prompt_only": conversation WITHOUT assistant turn
-            (for computing prompt length to mask labels)
           - "target_text": the target action JSON string
-
-        These are in Qwen2-VL chat format, compatible with
-        ``processor.apply_chat_template()``.
         """
-        import json
-
         text_prompt = self.build_text_prompt(
             task=task,
-            serialized_dom=serialized_dom,
+            candidates=candidates,
             action_history=action_history,
             extra_context=extra_context,
         )
@@ -235,13 +401,13 @@ class PromptBuilder:
             "text": text_prompt,
         })
 
-        # Prompt-only messages (no assistant turn) — for computing prompt length
+        # Prompt-only messages (no assistant turn)
         messages_prompt_only = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_content},
         ]
 
-        # Full messages with target — for tokenizing the complete training sequence
+        # Full messages with target
         messages_with_target = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_content},
@@ -254,6 +420,34 @@ class PromptBuilder:
             "target_text": target_text,
         }
 
+    # ── Backward compatibility ────────────────────────────────
+
+    def build_text_prompt_from_dom(
+        self,
+        task: str,
+        serialized_dom: str,
+        action_history: Optional[List[Dict[str, Any]]] = None,
+        extra_context: str = "",
+    ) -> str:
+        """Legacy: build text prompt from serialized DOM string (for eval compat)."""
+        parts = []
+        parts.append(f"[USER TASK]\n{task}\n")
+        if extra_context:
+            parts.append(f"[CONTEXT]\n{extra_context}\n")
+        if action_history:
+            history_text = self._format_history(action_history)
+            parts.append(f"[ACTION HISTORY]\n{history_text}\n")
+        else:
+            parts.append("[ACTION HISTORY]\nNo previous actions.\n")
+        dom_text = serialized_dom[:12000]
+        if len(serialized_dom) > 12000:
+            dom_text += "\n... (DOM truncated)"
+        parts.append(f"[CANDIDATE ELEMENTS]\n{dom_text}\n")
+        parts.append("[ACTION]\nChoose the correct candidate and action. Output exactly ONE JSON object:")
+        return "\n".join(parts)
+
+    # ── History formatting ────────────────────────────────────
+
     def _format_history(self, history: List[Dict[str, Any]]) -> str:
         """Format action history into readable text."""
         entries = history[-self.max_history_entries:]
@@ -265,18 +459,20 @@ class PromptBuilder:
             else:
                 step = entry.get("step", "?")
                 action = entry.get("action", "?")
-                eid = entry.get("element_id", "?")
-                line = f"Step {step}: {action} element_id={eid}"
+                candidate = entry.get("candidate", entry.get("element_id", "?"))
+                line = f"Step {step}: {action} candidate={candidate}"
                 value = entry.get("value")
                 if value:
                     line += f' value="{value}"'
                 lines.append(line)
         return "\n".join(lines)
 
+    # ── Target formatting ─────────────────────────────────────
+
     @staticmethod
     def format_action_target(
         action: str,
-        element_id: int = -1,
+        candidate: int = -1,
         value: str = "",
         direction: str = "",
         amount: int = 0,
@@ -284,12 +480,12 @@ class PromptBuilder:
         """
         Build a target action dict for training.
 
-        Constructs the expected model output format.
+        Uses candidate index instead of element_id.
         """
         d: Dict[str, Any] = {"action": action.upper()}
 
         if action.upper() in ("CLICK", "TYPE", "SELECT"):
-            d["element_id"] = element_id
+            d["candidate"] = candidate
 
         if action.upper() == "TYPE" and value:
             d["value"] = value

@@ -47,7 +47,7 @@ training:
 
   # Checkpointing
   save_every_n_epochs: 1
-  checkpoint_dir: "checkpoints"
+  checkpoint_dir: "checkpoints_v2"
   logging_steps: 10
 
   # Dataset
@@ -58,6 +58,8 @@ data:
   max_dom_nodes: 500
   max_action_history: 10
   max_text_per_node: 200
+  scroll_augmentation: true
+  scroll_aug_ratio: 0.2
 
 environment:
   headless: true
@@ -65,6 +67,7 @@ environment:
   viewport_height: 720
   timeout_ms: 30000
   max_steps: 30
+  max_scroll_attempts: 3
 
 uncertainty:
   # Token-level confidence

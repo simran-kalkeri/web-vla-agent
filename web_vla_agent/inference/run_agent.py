@@ -1,14 +1,15 @@
 """
-End-to-End Inference Pipeline for VLA Web Agent.
+End-to-End Inference Pipeline for VLA Web Agent — Candidate-Based.
 
-Reads real webpage → understands instruction → grounds element →
-generates action → executes → repeats until done.
+Reads real webpage → understands instruction → presents candidates →
+generates action with candidate index → executes → repeats until done.
 
 Features:
   - Full step loop with environment interaction
+  - Candidate-based element selection
   - Uncertainty-based replanning
   - Max steps + failure detection
-  - Action validation against DOM
+  - Action validation against candidate list
   - Detailed logging
 """
 from __future__ import annotations
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 class VLAAgent:
     """
     End-to-end VLA Web Agent for autonomous web navigation.
+
+    Uses candidate-based element selection: DOM elements are presented
+    as numbered candidates, and the model picks a candidate index.
 
     Parameters
     ----------
@@ -158,18 +162,32 @@ class VLAAgent:
                         url=state.url,
                     )
 
+                # Build candidate list from current DOM elements
+                candidates = self._build_candidates_from_state(state)
+
                 # Generate action
-                action_result = await self._generate_action(state, task)
+                action_result = await self._generate_action(
+                    state, task, candidates
+                )
                 step_results.append(action_result)
 
                 action = action_result.get("action")
+
+                # ── Auto-scroll fallback ─────────────────────────
+                # If model fails to generate valid action, try scrolling
+                # to reveal more elements, then re-prompt
                 if action is None:
-                    logger.warning("Failed to generate valid action")
+                    auto_scrolled = await self._auto_scroll_fallback(state)
+                    if auto_scrolled:
+                        state = await self.env.extract_state()
+                        logger.info("  Auto-scrolled (invalid action fallback)")
+                    else:
+                        logger.warning("Failed to generate valid action")
                     continue
 
-                # Check DONE
-                if action.get("action") == "DONE":
-                    logger.info("Model predicted DONE — task complete")
+                # Check STOP/DONE
+                if action.get("action") in ("STOP", "DONE"):
+                    logger.info("Model predicted STOP — task complete")
                     return self._make_result(
                         success=True,
                         steps=step_results,
@@ -177,12 +195,38 @@ class VLAAgent:
                         url=state.url,
                     )
 
-                # Execute action
-                web_action = WebAction.from_dict(action)
+                # ── Handle SCROLL action ─────────────────────────
+                if action.get("action") == "SCROLL":
+                    direction = action.get("direction", "down")
+                    amount = int(action.get("amount", 400))
+                    scroll_action = WebAction(
+                        action="SCROLL",
+                        direction=direction,
+                        amount=amount,
+                    )
+                    logger.info(f"Executing: SCROLL {direction} {amount}px")
+                    new_state = await self.env.step(scroll_action)
+                    state = new_state
+                    continue
+
+                # Map candidate index → node_id for execution
+                web_action = self._candidate_to_web_action(action, candidates)
+                if web_action is None:
+                    # Can't map candidate — try auto-scroll as fallback
+                    auto_scrolled = await self._auto_scroll_fallback(state)
+                    if auto_scrolled:
+                        state = await self.env.extract_state()
+                        logger.info("  Auto-scrolled (bad candidate fallback)")
+                    else:
+                        logger.warning("Could not map candidate to DOM element")
+                    continue
+
                 logger.info(f"Executing: {web_action.to_history_string()}")
 
                 new_state = await self.env.step(web_action)
-                logger.info(f"  → Page: {new_state.page_title} URL: {new_state.url}")
+                logger.info(
+                    f"  → Page: {new_state.page_title} URL: {new_state.url}"
+                )
 
                 # Save step screenshot for debugging
                 if new_state.screenshot:
@@ -192,7 +236,9 @@ class VLAAgent:
                 curr_state_dict = {
                     "url": new_state.url,
                     "page_title": new_state.page_title,
-                    "html_snippet": new_state.dom_tree[:500] if new_state.dom_tree else "",
+                    "html_snippet": (
+                        new_state.dom_tree[:500] if new_state.dom_tree else ""
+                    ),
                 }
                 failure = self.failure_detector.detect(
                     prev_state=prev_state_dict,
@@ -200,7 +246,9 @@ class VLAAgent:
                     action=action,
                 )
                 if failure != FailureType.NONE:
-                    logger.warning(f"Failure detected: {failure.value} — stopping")
+                    logger.warning(
+                        f"Failure detected: {failure.value} — stopping"
+                    )
                     return self._make_result(
                         success=False,
                         steps=step_results,
@@ -224,36 +272,128 @@ class VLAAgent:
         finally:
             await self.env.close()
 
+    def _build_candidates_from_state(
+        self,
+        state: BrowserState,
+    ) -> List[Dict[str, Any]]:
+        """
+        Build a candidate list from the browser state's DOM elements.
+
+        Each candidate gets a sequential index (0, 1, 2, ...) and
+        maps to the original DOM node_id for action execution.
+        """
+        candidates = []
+
+        # Prefer interactable elements, but include all visible ones
+        elements = state.dom_elements or []
+
+        # Sort: interactable first
+        interactable = [e for e in elements if e.get("is_interactable")]
+        non_interactable = [e for e in elements if not e.get("is_interactable")]
+        sorted_elements = interactable + non_interactable
+
+        # Limit to prevent prompt overflow
+        max_candidates = self.prompt_builder.max_candidates
+        for i, el in enumerate(sorted_elements[:max_candidates]):
+            candidates.append({
+                "candidate_index": i,
+                "tag": el.get("tag", "div"),
+                "text": str(el.get("text", ""))[:200],
+                "attributes": el.get("attributes", {}),
+                "node_id": el.get("node_id", -1),
+            })
+
+        return candidates
+
+    def _candidate_to_web_action(
+        self,
+        action: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+    ) -> Optional[WebAction]:
+        """
+        Map a candidate-based action to a WebAction with the real node_id.
+        """
+        candidate_idx = action.get("candidate", -1)
+
+        if candidate_idx < 0 or candidate_idx >= len(candidates):
+            return None
+
+        node_id = candidates[candidate_idx].get("node_id", -1)
+        if node_id < 0:
+            return None
+
+        return WebAction(
+            action=action.get("action", "CLICK").upper(),
+            element_id=node_id,
+            value=action.get("value", ""),
+            direction=action.get("direction", "down"),
+            amount=int(action.get("amount", 300)),
+        )
+
+    async def _auto_scroll_fallback(self, state: BrowserState) -> bool:
+        """
+        Auto-scroll the page as a fallback when the model can't find
+        a valid candidate.
+
+        Returns True if scroll was executed, False if max attempts reached.
+        """
+        max_scroll_attempts = getattr(
+            self.config.environment, "max_scroll_attempts", 3
+        )
+
+        if not hasattr(self, "_scroll_attempts"):
+            self._scroll_attempts = 0
+
+        if self._scroll_attempts >= max_scroll_attempts:
+            logger.info(
+                f"  Max scroll attempts ({max_scroll_attempts}) reached"
+            )
+            self._scroll_attempts = 0  # Reset for next step
+            return False
+
+        self._scroll_attempts += 1
+        scroll_action = WebAction(
+            action="SCROLL", direction="down", amount=400
+        )
+        try:
+            await self.env.step(scroll_action)
+            logger.info(
+                f"  Auto-scroll attempt {self._scroll_attempts}/"
+                f"{max_scroll_attempts}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"  Auto-scroll failed: {e}")
+            return False
+
     async def _generate_action(
         self,
         state: BrowserState,
         task: str,
+        candidates: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
         Generate and validate an action for the current state.
 
         Uses uncertainty estimation and regeneration if needed.
         """
-        # Build prompt
+        # Build prompt with candidate list
         extra_context = f"URL: {state.url}\nPage: {state.page_title}"
         messages = self.prompt_builder.build_chat_messages(
             task=task,
-            serialized_dom=state.serialized_dom,
+            candidates=candidates,
             action_history=state.action_history,
             screenshot_placeholder=state.screenshot is not None,
             extra_context=extra_context,
         )
 
-        # Debug: show what we're feeding the model
-        dom_len = len(state.serialized_dom) if state.serialized_dom else 0
-        num_elements = len(state.dom_elements) if state.dom_elements else 0
+        # Debug
+        num_cands = len(candidates)
         img_size = state.screenshot.size if state.screenshot else None
-        print(f"  [DEBUG] DOM chars: {dom_len}, DOM elements: {num_elements}, Screenshot: {img_size}")
-        if dom_len < 50:
-            print(f"  [DEBUG] DOM content: {state.serialized_dom!r}")
-
-        # Get valid node IDs from current DOM
-        valid_ids = [el.get("node_id", -1) for el in state.dom_elements]
+        print(
+            f"  [DEBUG] Candidates: {num_cands}, "
+            f"Screenshot: {img_size}"
+        )
 
         # Generate with log probabilities
         start = time.time()
@@ -270,13 +410,15 @@ class VLAAgent:
 
         # Parse and validate
         action, is_valid, error = self.action_decoder.parse_and_validate(
-            result["text"], valid_ids,
+            result["text"], num_candidates=num_cands,
         )
 
         # Check uncertainty — regenerate if low confidence
         uncertainty = self.uncertainty.assess(result)
         if uncertainty.should_regenerate and not is_valid:
-            logger.info(f"  Low confidence ({uncertainty.reason}) — regenerating...")
+            logger.info(
+                f"  Low confidence ({uncertainty.reason}) — regenerating..."
+            )
             for attempt in range(self.uncertainty.max_regenerations):
                 result = self.model.generate(
                     messages=messages,
@@ -284,11 +426,15 @@ class VLAAgent:
                     temperature=0.3 + attempt * 0.1,
                     return_log_probs=True,
                 )
-                action, is_valid, error = self.action_decoder.parse_and_validate(
-                    result["text"], valid_ids,
+                action, is_valid, error = (
+                    self.action_decoder.parse_and_validate(
+                        result["text"], num_candidates=num_cands,
+                    )
                 )
                 if is_valid:
-                    logger.info(f"  Regeneration {attempt + 1} succeeded")
+                    logger.info(
+                        f"  Regeneration {attempt + 1} succeeded"
+                    )
                     break
 
         if not is_valid:

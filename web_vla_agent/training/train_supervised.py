@@ -96,10 +96,10 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     all_images = []
 
     for sample in batch:
-        # Build multimodal chat messages with target
+        # Build multimodal chat messages with target (candidate-based)
         training_data = prompt_builder.build_training_messages(
             task=sample.task,
-            serialized_dom=sample.serialized_dom,
+            candidates=sample.candidates,
             target_action=sample.action,
             screenshot=sample.screenshot,
             action_history=sample.action_history,
@@ -525,16 +525,16 @@ class VLATrainer:
 
         val_subset = val_samples[:max_val_samples]
         correct_actions = 0
-        correct_elements = 0
+        correct_candidates = 0
         total = 0
 
         with torch.no_grad():
             for sample in val_subset:
                 try:
-                    # Build prompt
+                    # Build prompt (candidate-based)
                     messages = prompt_builder.build_chat_messages(
                         task=sample.task,
-                        serialized_dom=sample.serialized_dom,
+                        candidates=sample.candidates,
                         action_history=sample.action_history,
                         screenshot_placeholder=(sample.screenshot is not None),
                     )
@@ -551,10 +551,11 @@ class VLATrainer:
                     gt = sample.action
 
                     if pred:
+                        pred = decoder.normalize(pred)
                         if pred.get("action") == gt.get("action"):
                             correct_actions += 1
-                        if pred.get("element_id") == gt.get("element_id"):
-                            correct_elements += 1
+                        if pred.get("candidate") == gt.get("candidate"):
+                            correct_candidates += 1
 
                     total += 1
                 except Exception:
@@ -565,7 +566,7 @@ class VLATrainer:
 
         return {
             "val_action_acc": correct_actions / max(total, 1),
-            "val_element_acc": correct_elements / max(total, 1),
+            "val_element_acc": correct_candidates / max(total, 1),
             "val_total": total,
         }
 

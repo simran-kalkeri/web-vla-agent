@@ -1,9 +1,9 @@
 """
-Evaluation Module for VLA Web Agent.
+Evaluation Module for VLA Web Agent — Candidate-Based.
 
 Implements all required metrics:
-  - Element grounding accuracy
-  - Action accuracy (full JSON match)
+  - Candidate accuracy (correct candidate index selection)
+  - Action accuracy (correct action type)
   - Task completion rate
   - Mean steps to completion
   - Failure mode breakdown
@@ -34,7 +34,7 @@ class StepResult:
     predicted_action: Dict[str, Any] = field(default_factory=dict)
     ground_truth_action: Dict[str, Any] = field(default_factory=dict)
     action_correct: bool = False
-    element_correct: bool = False
+    candidate_correct: bool = False
     value_correct: bool = False
     full_match: bool = False
     latency_ms: float = 0.0
@@ -59,6 +59,7 @@ class VLAEvaluator:
     Evaluate VLA Web Agent on Mind2Web test sets.
 
     Computes all required metrics and produces detailed reports.
+    Uses candidate-based action format.
     """
 
     def __init__(self, action_types: Optional[List[str]] = None):
@@ -81,21 +82,22 @@ class VLAEvaluator:
 
         action_correct = pred_action == gt_action
 
-        pred_eid = predicted.get("element_id")
-        gt_eid = ground_truth.get("element_id")
-        element_correct = pred_eid == gt_eid
+        # Candidate comparison
+        pred_candidate = predicted.get("candidate", -1)
+        gt_candidate = ground_truth.get("candidate", -1)
+        candidate_correct = pred_candidate == gt_candidate
 
         pred_value = str(predicted.get("value", "")).strip().lower()
         gt_value = str(ground_truth.get("value", "")).strip().lower()
         value_correct = pred_value == gt_value if gt_value else True
 
-        full_match = action_correct and element_correct and value_correct
+        full_match = action_correct and candidate_correct and value_correct
 
         result = StepResult(
             predicted_action=predicted,
             ground_truth_action=ground_truth,
             action_correct=action_correct,
-            element_correct=element_correct,
+            candidate_correct=candidate_correct,
             value_correct=value_correct,
             full_match=full_match,
             latency_ms=latency_ms,
@@ -130,20 +132,16 @@ class VLAEvaluator:
         for i, sample in enumerate(eval_samples):
             result = None
             try:
-                # Build prompt
+                # Build prompt using candidate list
                 messages = prompt_builder.build_chat_messages(
                     task=sample.task,
-                    serialized_dom=sample.serialized_dom,
+                    candidates=sample.candidates,
                     action_history=sample.action_history,
                     screenshot_placeholder=sample.screenshot is not None,
                     extra_context=f"Website: {sample.website}" if sample.website else "",
                 )
 
-                # Generate with timing.
-                # return_log_probs=False by default: disables output_scores=True,
-                # which would otherwise accumulate 256 × vocab_size logit tensors
-                # (~77 MB) on GPU per call.  Enable only when confidence-gated
-                # re-generation is needed.
+                # Generate
                 start = time.time()
                 result = model.generate(
                     messages=messages,
@@ -156,6 +154,8 @@ class VLAEvaluator:
                 pred_action = action_decoder.parse(result["text"])
                 if pred_action is None:
                     pred_action = {"action": "UNKNOWN"}
+                else:
+                    pred_action = action_decoder.normalize(pred_action)
 
                 # Evaluate
                 self.evaluate_step(
@@ -172,13 +172,6 @@ class VLAEvaluator:
                     parse_success=False,
                 ))
             finally:
-                # Correct cleanup order:
-                #   1. del result   — drop Python reference so refcount hits 0
-                #   2. gc.collect() — collect reference cycles from PEFT/Accelerate
-                #                     hooks that CPython's refcount alone misses
-                #   3. empty_cache() — only NOW can the CUDA allocator reclaim
-                #                      memory from tensors with zero references
-                # Calling empty_cache() BEFORE del/gc is a no-op for live tensors.
                 del result
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -194,13 +187,11 @@ class VLAEvaluator:
         Compute all evaluation metrics.
 
         Returns dict with:
-          - element_accuracy
+          - candidate_accuracy
           - action_accuracy
           - full_match_accuracy
           - per_action_f1
           - mean_latency_ms
-          - failure_breakdown
-          - parse_success_rate
         """
         if not self.step_results:
             return {}
@@ -215,10 +206,13 @@ class VLAEvaluator:
         }
 
         if valid:
-            metrics["element_accuracy"] = sum(1 for r in valid if r.element_correct) / len(valid)
+            metrics["candidate_accuracy"] = sum(1 for r in valid if r.candidate_correct) / len(valid)
             metrics["action_accuracy"] = sum(1 for r in valid if r.action_correct) / len(valid)
             metrics["value_accuracy"] = sum(1 for r in valid if r.value_correct) / len(valid)
             metrics["full_match_accuracy"] = sum(1 for r in valid if r.full_match) / len(valid)
+
+            # Backward compat alias
+            metrics["element_accuracy"] = metrics["candidate_accuracy"]
 
             latencies = [r.latency_ms for r in valid if r.latency_ms > 0]
             if latencies:
@@ -252,7 +246,7 @@ class VLAEvaluator:
                 per_action[pred_action]["fp"] += 1
 
         metrics = {}
-        for action_type in self.action_types + ["UNKNOWN", "DONE"]:
+        for action_type in self.action_types + ["UNKNOWN", "STOP"]:
             counts = per_action.get(action_type, {"tp": 0, "fp": 0, "fn": 0})
             tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
 
@@ -278,8 +272,8 @@ class VLAEvaluator:
                 continue
             if not r.action_correct:
                 failures["wrong_action_type"] += 1
-            elif not r.element_correct:
-                failures["wrong_element"] += 1
+            elif not r.candidate_correct:
+                failures["wrong_candidate"] += 1
             elif not r.value_correct:
                 failures["wrong_value"] += 1
         failures["total_failures"] = sum(failures.values())
@@ -298,7 +292,7 @@ class VLAEvaluator:
 
         print(f"\n  Total samples:      {metrics.get('total_samples', 0)}")
         print(f"  Parse success rate: {metrics.get('parse_success_rate', 0):.1%}")
-        print(f"\n  Element accuracy:   {metrics.get('element_accuracy', 0):.1%}")
+        print(f"\n  Candidate accuracy: {metrics.get('candidate_accuracy', 0):.1%}")
         print(f"  Action accuracy:    {metrics.get('action_accuracy', 0):.1%}")
         print(f"  Value accuracy:     {metrics.get('value_accuracy', 0):.1%}")
         print(f"  Full match:         {metrics.get('full_match_accuracy', 0):.1%}")
@@ -342,7 +336,7 @@ def main():
     config = load_config(args.config)
     log = get_logger("vla.eval")
 
-    # Load model in pure bfloat16 with device_map="auto".
+    # Load model
     model = VLAModel(config=config, device=args.device)
     model.load()
     if args.checkpoint:
@@ -373,7 +367,6 @@ def main():
     evaluator.print_report(metrics)
 
     # Save results
-    import json
     with open("evaluation_results.json", "w") as f:
         json.dump(metrics, f, indent=2)
     log.info("Results saved to evaluation_results.json")
