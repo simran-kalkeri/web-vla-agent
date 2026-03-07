@@ -317,6 +317,16 @@ class VLAEvaluator:
 def main():
     """Main evaluation entry point."""
     import argparse
+    import os
+
+    # SSL certificate bypass (matching train_supervised.py)
+    os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
+    os.environ.setdefault("CURL_CA_BUNDLE", "")
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     parser = argparse.ArgumentParser(description="VLA Web Agent Evaluation")
     parser.add_argument("--config", type=str, default=None)

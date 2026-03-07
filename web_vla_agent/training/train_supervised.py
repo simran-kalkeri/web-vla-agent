@@ -583,7 +583,20 @@ class VLATrainer:
 def main():
     """Main training entry point."""
     import argparse
+    import os
     import sys
+
+    # ── SSL certificate bypass ───────────────────────────────
+    # Corporate/proxy environments may inject self-signed certs
+    # that break HuggingFace Hub downloads. Disable verification.
+    os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
+    os.environ.setdefault("CURL_CA_BUNDLE", "")
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
+    # Suppress urllib3 InsecureRequestWarning
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     parser = argparse.ArgumentParser(description="VLA Web Agent Training")
     parser.add_argument("--config", type=str, default=None)

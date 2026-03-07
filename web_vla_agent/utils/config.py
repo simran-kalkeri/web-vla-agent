@@ -64,6 +64,8 @@ class DataConfig:
     max_dom_nodes: int = 500
     max_action_history: int = 10
     max_text_per_node: int = 200
+    scroll_augmentation: bool = True
+    scroll_aug_ratio: float = 0.2
 
 
 @dataclass
@@ -73,6 +75,7 @@ class EnvironmentConfig:
     viewport_height: int = 720
     timeout_ms: int = 30000
     max_steps: int = 30
+    max_scroll_attempts: int = 3
 
 
 @dataclass

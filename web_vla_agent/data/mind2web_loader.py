@@ -252,6 +252,8 @@ class Mind2WebLoader:
             trajectory_id=sample_id,
         )
 
+    _LOGGED_FIRST_CANDIDATE = False
+
     def _build_candidates(
         self,
         raw_sample: Dict[str, Any],
@@ -259,6 +261,12 @@ class Mind2WebLoader:
     ) -> Tuple[List[Dict[str, Any]], int]:
         """
         Build the candidate list from pos_candidates and neg_candidates.
+
+        Handles all observed Mind2Web data formats:
+          - list of JSON strings (most common)
+          - list of [backend_node_id, dict] pairs
+          - list of dicts
+          - a single JSON string wrapping a list
 
         Returns
         -------
@@ -270,7 +278,7 @@ class Mind2WebLoader:
         pos_candidates = raw_sample.get("pos_candidates", [])
         neg_candidates = raw_sample.get("neg_candidates", [])
 
-        # Parse if string
+        # Parse top-level if it's a single JSON string wrapping a list
         if isinstance(pos_candidates, str):
             try:
                 pos_candidates = json.loads(pos_candidates)
@@ -282,26 +290,42 @@ class Mind2WebLoader:
             except json.JSONDecodeError:
                 neg_candidates = []
 
+        # Ensure list
+        if not isinstance(pos_candidates, list):
+            pos_candidates = [pos_candidates] if pos_candidates else []
+        if not isinstance(neg_candidates, list):
+            neg_candidates = [neg_candidates] if neg_candidates else []
+
+        # Diagnostic logging on first sample to surface actual data format
+        if not Mind2WebLoader._LOGGED_FIRST_CANDIDATE and pos_candidates:
+            Mind2WebLoader._LOGGED_FIRST_CANDIDATE = True
+            first = pos_candidates[0]
+            logger.info("═══ CANDIDATE FORMAT DIAGNOSTICS ═══")
+            logger.info(f"  pos_candidates length: {len(pos_candidates)}")
+            logger.info(f"  neg_candidates length: {len(neg_candidates)}")
+            logger.info(f"  First pos_candidate type: {type(first).__name__}")
+            logger.info(f"  First pos_candidate preview: {str(first)[:300]}")
+            logger.info("═════════════════════════════════════")
+
         if not pos_candidates:
             return [], -1
 
         # Extract the first positive candidate
-        if isinstance(pos_candidates, list) and len(pos_candidates) > 0:
-            pos_cand = pos_candidates[0]
-        else:
-            pos_cand = pos_candidates
-
+        pos_cand = pos_candidates[0]
         pos_element = self._candidate_to_element(pos_cand, is_positive=True)
         if pos_element is None:
+            logger.debug(
+                f"Failed to parse pos_candidate: type={type(pos_cand).__name__}, "
+                f"preview={str(pos_cand)[:200]}"
+            )
             return [], -1
 
         # Extract negative candidates (limit count)
         neg_elements = []
-        if isinstance(neg_candidates, list):
-            for nc in neg_candidates[:self.max_neg_candidates]:
-                el = self._candidate_to_element(nc, is_positive=False)
-                if el is not None:
-                    neg_elements.append(el)
+        for nc in neg_candidates[:self.max_neg_candidates]:
+            el = self._candidate_to_element(nc, is_positive=False)
+            if el is not None:
+                neg_elements.append(el)
 
         # If we have no neg candidates from the dataset, try to extract from DOM
         if not neg_elements and cleaned_html:
@@ -336,22 +360,53 @@ class Mind2WebLoader:
         """
         Convert a Mind2Web candidate (pos or neg) to a candidate element dict.
 
-        Mind2Web candidates can be:
-          - a JSON string (most common in the actual dataset)
-          - a dict with keys like backend_node_id, tag, text, attributes
-          - a list [backend_node_id, ...]
-          - an int (just backend_node_id)
+        Mind2Web candidates appear in several formats:
+          1. JSON string: '{"tag":"button","attributes":"...","text":"Search"}'
+          2. Dict: {"tag":"button", "attributes":"...", "text":"Search"}
+          3. Two-element list: [backend_node_id, {"tag":"...", ...}]
+          4. Int: just a backend_node_id
         """
         if candidate is None:
             return None
 
-        # ── Handle JSON strings (the actual Mind2Web format) ─────
+        # ── 1. Handle JSON strings ───────────────────────────────
         if isinstance(candidate, str):
             try:
                 candidate = json.loads(candidate)
             except json.JSONDecodeError:
                 return None
 
+        # ── 2. Handle two-element list: [backend_node_id, dict] ──
+        if isinstance(candidate, list):
+            if len(candidate) == 2 and isinstance(candidate[1], dict):
+                # [backend_node_id, {tag, text, attributes, ...}]
+                inner = dict(candidate[1])
+                try:
+                    inner.setdefault("backend_node_id", int(candidate[0]))
+                except (ValueError, TypeError):
+                    inner.setdefault("backend_node_id", -1)
+                candidate = inner
+            elif len(candidate) == 2 and isinstance(candidate[1], str):
+                # [backend_node_id, JSON-string]
+                try:
+                    inner = json.loads(candidate[1])
+                    if isinstance(inner, dict):
+                        try:
+                            inner.setdefault("backend_node_id", int(candidate[0]))
+                        except (ValueError, TypeError):
+                            inner.setdefault("backend_node_id", -1)
+                        candidate = inner
+                    else:
+                        return self._make_minimal_element(candidate[0], is_positive)
+                except json.JSONDecodeError:
+                    return self._make_minimal_element(candidate[0], is_positive)
+            elif len(candidate) > 0:
+                # Generic list — try first element as backend_node_id
+                return self._make_minimal_element(candidate[0], is_positive)
+            else:
+                return None
+
+        # ── 3. Handle dict (standard case) ───────────────────────
         if isinstance(candidate, dict):
             tag = candidate.get("tag", "")
             if not tag:
@@ -370,7 +425,7 @@ class Mind2WebLoader:
                 except json.JSONDecodeError:
                     attributes = self._parse_attr_string(attributes)
 
-            # Extract backend_node_id (may be in attributes dict)
+            # Extract backend_node_id (may be in attributes dict or top-level)
             backend_node_id = candidate.get("backend_node_id", -1)
             if backend_node_id == -1 and isinstance(attributes, dict):
                 try:
@@ -386,26 +441,29 @@ class Mind2WebLoader:
                 "_is_positive": is_positive,
             }
 
+        # ── 4. Handle int/float (just backend_node_id) ───────────
         elif isinstance(candidate, (int, float)):
-            return {
-                "tag": "div",
-                "text": "",
-                "attributes": {},
-                "backend_node_id": int(candidate),
-                "_is_positive": is_positive,
-            }
-
-        elif isinstance(candidate, list) and len(candidate) > 0:
-            # Try first element as backend_node_id
-            return {
-                "tag": "div",
-                "text": "",
-                "attributes": {},
-                "backend_node_id": candidate[0] if isinstance(candidate[0], int) else -1,
-                "_is_positive": is_positive,
-            }
+            return self._make_minimal_element(candidate, is_positive)
 
         return None
+
+    def _make_minimal_element(
+        self,
+        backend_node_id: Any,
+        is_positive: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a minimal candidate element from just a backend_node_id."""
+        try:
+            nid = int(backend_node_id)
+        except (ValueError, TypeError):
+            return None
+        return {
+            "tag": "div",
+            "text": "",
+            "attributes": {},
+            "backend_node_id": nid,
+            "_is_positive": is_positive,
+        }
 
     def _parse_attr_string(self, attr_str: str) -> Dict[str, str]:
         """Parse HTML-style attribute string into dict."""

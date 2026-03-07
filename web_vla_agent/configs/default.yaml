@@ -23,7 +23,7 @@ model:
   image_max_pixels: 401408     # 512 * 28 * 28 — ~450 vision tokens max
 
   # Action types
-  action_types: ["CLICK", "TYPE", "SELECT", "SCROLL"]
+  action_types: ["CLICK", "TYPE", "SELECT", "SCROLL", "DONE"]
 
 training:
   # Stage 1: Single-step imitation
@@ -47,7 +47,7 @@ training:
 
   # Checkpointing
   save_every_n_epochs: 1
-  checkpoint_dir: "checkpoints_v2"
+  checkpoint_dir: "checkpoints_v12"
   logging_steps: 10
 
   # Dataset
