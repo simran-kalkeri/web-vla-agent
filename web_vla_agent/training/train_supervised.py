@@ -313,6 +313,8 @@ class VLATrainer:
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             epoch_steps = 0
+            nan_count = 0       # consecutive NaN batches
+            nan_total = 0       # total NaN batches this epoch
             start_time = time.time()
 
             self.optimizer.zero_grad()
@@ -328,6 +330,33 @@ class VLATrainer:
                         image_grid_thw=batch.get("image_grid_thw"),
                     )
 
+                    # ── NaN detection ────────────────────────────
+                    # A single NaN backward pass poisons all model
+                    # weights permanently. Skip the batch instead.
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        nan_count += 1
+                        nan_total += 1
+                        if nan_count == 1:
+                            print(
+                                f"  ⚠️  NaN/Inf loss at batch {batch_idx+1}, "
+                                f"skipping (won't backward through NaN)"
+                            )
+                        if nan_count >= 10:
+                            print(
+                                f"  ❌ {nan_count} consecutive NaN batches — "
+                                f"model weights likely corrupted. "
+                                f"Try lowering LR or enabling fp32."
+                            )
+                            break
+                        # Zero out any accumulated gradients to
+                        # prevent partial NaN contamination
+                        self.optimizer.zero_grad()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    nan_count = 0  # reset consecutive counter
+
                     # Scale loss for gradient accumulation
                     scaled_loss = loss / grad_accum
                     scaled_loss.backward()
@@ -337,10 +366,21 @@ class VLATrainer:
 
                     if (batch_idx + 1) % grad_accum == 0:
                         # Gradient clipping + optimizer step
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in self.model.model.parameters() if p.requires_grad],
+                        trainable = [p for p in self.model.model.parameters() if p.requires_grad]
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            trainable,
                             self.config.training.max_grad_norm,
                         )
+
+                        # Skip step if gradients themselves are NaN
+                        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                            print(
+                                f"  ⚠️  NaN grad_norm at step {total_steps+1}, "
+                                f"zeroing grads (batch {batch_idx+1})"
+                            )
+                            self.optimizer.zero_grad()
+                            continue
+
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         total_steps += 1
@@ -350,7 +390,8 @@ class VLATrainer:
                             f"  ⚡ Step {total_steps} | "
                             f"Epoch {epoch+1}/{num_epochs} | "
                             f"Batch {batch_idx+1}/{num_batches} | "
-                            f"Loss: {avg_loss:.4f}"
+                            f"Loss: {avg_loss:.4f} | "
+                            f"GradNorm: {grad_norm:.2f}"
                         )
 
                 except RuntimeError as e:
@@ -364,6 +405,9 @@ class VLATrainer:
                         self.optimizer.zero_grad()
                         continue
                     raise
+
+            if nan_total > 0:
+                print(f"  ℹ️  Epoch {epoch+1}: {nan_total} NaN batches skipped")
 
             # ── End-of-epoch: flush any remaining accumulated gradients ──
             # Without this, if num_batches < grad_accum, the optimizer

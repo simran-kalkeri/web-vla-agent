@@ -527,10 +527,17 @@ class VLAModel:
 
         if pixel_values is not None:
             # Cast to model compute dtype — processor returns float32,
-            # but vision encoder runs in bfloat16 under QLoRA
-            kwargs["pixel_values"] = pixel_values.to(
-                device=device, dtype=torch.bfloat16
-            )
+            # but vision encoder runs in bfloat16 under QLoRA.
+            pv = pixel_values.to(device=device, dtype=torch.bfloat16)
+
+            # Clamp to prevent bfloat16 overflow in vision encoder.
+            # bfloat16 max ≈ 3.4e38 but extreme pixel values from corrupt
+            # images can cause NaN in rotary position embeddings.
+            if torch.isnan(pv).any() or torch.isinf(pv).any():
+                logger.warning("NaN/Inf in pixel_values — replacing with zeros")
+                pv = torch.nan_to_num(pv, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            kwargs["pixel_values"] = pv
 
         if image_grid_thw is not None:
             # MUST be int64 (torch.LongTensor) — HF docs specify this.
