@@ -337,12 +337,20 @@ class Mind2WebLoader:
         Convert a Mind2Web candidate (pos or neg) to a candidate element dict.
 
         Mind2Web candidates can be:
+          - a JSON string (most common in the actual dataset)
           - a dict with keys like backend_node_id, tag, text, attributes
           - a list [backend_node_id, ...]
           - an int (just backend_node_id)
         """
         if candidate is None:
             return None
+
+        # ── Handle JSON strings (the actual Mind2Web format) ─────
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except json.JSONDecodeError:
+                return None
 
         if isinstance(candidate, dict):
             tag = candidate.get("tag", "")
@@ -352,18 +360,23 @@ class Mind2WebLoader:
 
             text = candidate.get("text", "")
             if not text:
-                # Try to get from attributes
                 text = candidate.get("value", "")
 
+            # Parse attributes — Mind2Web stores them as a nested JSON string
             attributes = candidate.get("attributes", {})
             if isinstance(attributes, str):
                 try:
                     attributes = json.loads(attributes)
                 except json.JSONDecodeError:
-                    # Try parsing as HTML-style attributes
                     attributes = self._parse_attr_string(attributes)
 
+            # Extract backend_node_id (may be in attributes dict)
             backend_node_id = candidate.get("backend_node_id", -1)
+            if backend_node_id == -1 and isinstance(attributes, dict):
+                try:
+                    backend_node_id = int(attributes.get("backend_node_id", -1))
+                except (ValueError, TypeError):
+                    backend_node_id = -1
 
             return {
                 "tag": tag,
