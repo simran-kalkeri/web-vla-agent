@@ -585,7 +585,7 @@ class VLAModel:
             self.model.save_pretrained(path)
             logger.info(f"LoRA adapters saved to {path}")
 
-    def load_lora(self, path: str) -\u003e None:
+    def load_lora(self, path: str) -> None:
         """Load LoRA adapter weights and enable them for continued training."""
         if not self._is_loaded:
             self.load()
