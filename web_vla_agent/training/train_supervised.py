@@ -667,15 +667,6 @@ def main():
         max_dom_nodes=config.data.max_dom_nodes,
     )
 
-    log.info("Loading training data...")
-    train_samples = loader.build_training_examples(
-        split="train",
-        max_samples=args.max_samples,
-        include_screenshot=True,
-    )
-
-    log.info(f"Loaded {len(train_samples)} training samples")
-
     # Initialize trainer
     trainer = VLATrainer(config=config, device=args.device)
     trainer.setup()
@@ -687,7 +678,15 @@ def main():
         log.info("Checkpoint loaded — continuing training from prior stage weights")
 
     # Run training stages (mutually exclusive)
+    # Data is loaded per-stage to avoid doubling RAM usage.
     if args.stage == 1:
+        log.info("Loading training data for Stage 1...")
+        train_samples = loader.build_training_examples(
+            split="train",
+            max_samples=args.max_samples,
+            include_screenshot=True,
+        )
+        log.info(f"Loaded {len(train_samples)} training samples")
         result = trainer.train_stage1(train_samples)
         log.info(f"Stage 1 complete: {result}")
 
@@ -704,6 +703,7 @@ def main():
             max_samples=args.max_samples,
             include_screenshot=True,
         )
+        log.info(f"Built {len(trajectories)} trajectories")
         result = trainer.train_stage2(trajectories)
         log.info(f"Stage 2 complete: {result}")
 
