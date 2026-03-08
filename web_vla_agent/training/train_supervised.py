@@ -648,6 +648,9 @@ def main():
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Limit training samples (None = full dataset)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to prior stage checkpoint to resume from "
+                             "(e.g. checkpoints_v12/stage1_epoch5 for Stage 2)")
     args = parser.parse_args()
 
     # Setup
@@ -677,12 +680,24 @@ def main():
     trainer = VLATrainer(config=config, device=args.device)
     trainer.setup()
 
-    # Run training stages
-    if args.stage >= 1:
+    # Load prior stage checkpoint if specified
+    if args.checkpoint:
+        log.info(f"Loading checkpoint: {args.checkpoint}")
+        trainer.model.load_lora(args.checkpoint)
+        log.info("Checkpoint loaded — continuing training from prior stage weights")
+
+    # Run training stages (mutually exclusive)
+    if args.stage == 1:
         result = trainer.train_stage1(train_samples)
         log.info(f"Stage 1 complete: {result}")
 
-    if args.stage >= 2:
+    if args.stage == 2:
+        if not args.checkpoint:
+            log.warning(
+                "Stage 2 requested without --checkpoint. "
+                "Consider passing --checkpoint checkpoints_v12/stage1_epoch5 "
+                "to continue from Stage 1 weights."
+            )
         log.info("Building trajectories for Stage 2...")
         trajectories = loader.build_trajectories(
             split="train",
