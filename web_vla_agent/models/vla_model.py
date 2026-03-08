@@ -585,8 +585,8 @@ class VLAModel:
             self.model.save_pretrained(path)
             logger.info(f"LoRA adapters saved to {path}")
 
-    def load_lora(self, path: str) -> None:
-        """Load LoRA adapter weights."""
+    def load_lora(self, path: str) -\u003e None:
+        """Load LoRA adapter weights and enable them for continued training."""
         if not self._is_loaded:
             self.load()
 
@@ -605,3 +605,22 @@ class VLAModel:
         from peft import PeftModel
         self.model = PeftModel.from_pretrained(self.model, path)
         logger.info(f"LoRA adapters loaded from {path}")
+
+        # ── Critical: enable LoRA for continued training ─────────
+        # PeftModel.from_pretrained() loads in INFERENCE mode by
+        # default (all LoRA weights frozen). We must explicitly
+        # enable training on the adapter.
+        self.model.train()
+
+        # Ensure all LoRA parameters are trainable
+        trainable_count = 0
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+                trainable_count += 1
+            else:
+                param.requires_grad = False
+
+        logger.info(
+            f"LoRA training enabled: {trainable_count} trainable parameters unfrozen"
+        )
