@@ -72,6 +72,8 @@ class Mind2WebVLADataset(Dataset):
 
 # ── Multimodal collate function ──────────────────────────────
 
+_PRINTED_SAMPLE = False
+
 def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048):
     """
     Collate Mind2WebSamples into a multimodal training batch.
@@ -92,6 +94,29 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
       - pixel_values: processor-managed tensor
       - image_grid_thw: processor-managed tensor
     """
+    global _PRINTED_SAMPLE
+
+    # ── One-shot diagnostic: verify candidate-label alignment ──
+    if not _PRINTED_SAMPLE and len(batch) > 0:
+        _PRINTED_SAMPLE = True
+        s = batch[0]
+        print("\n========== TRAINING SAMPLE DEBUG ==========")
+        print(f"TASK: {s.task}")
+        print(f"TARGET ACTION: {s.action}")
+        print(f"TARGET INDEX: {s.target_candidate_index}")
+        print(f"\nCANDIDATES ({len(s.candidates)} total):")
+        for c in s.candidates:
+            idx = c.get("candidate_index", "?")
+            tag = c.get("tag", "")
+            text = c.get("text", "")[:60]
+            marker = "  <<< TARGET >>>" if idx == s.target_candidate_index else ""
+            print(f"  [{idx}] <{tag}> {text}{marker}")
+        if hasattr(s, 'action_history') and s.action_history:
+            print(f"\nACTION HISTORY ({len(s.action_history)} steps):")
+            for h in s.action_history[-3:]:
+                print(f"  {h}")
+        print("==========================================\n")
+
     all_full_texts = []
     all_images = []
 
@@ -249,8 +274,16 @@ class VLATrainer:
         self.optimizer = None
         self.scheduler = None
 
-    def setup(self) -> None:
-        """Initialize model, optimizer, and scheduler."""
+    def setup(self, skip_lora: bool = False) -> None:
+        """Initialize model, optimizer, and scheduler.
+
+        Parameters
+        ----------
+        skip_lora : bool
+            If True, skip apply_lora(). Use when loading a checkpoint
+            via load_lora() — that method creates its own PeftModel
+            wrapper. Calling both would double-wrap and OOM.
+        """
         from models.vla_model import VLAModel
 
         logger.info("Setting up VLA model for training...")
@@ -258,7 +291,10 @@ class VLATrainer:
         # Load model with QLoRA
         self.model = VLAModel(config=self.config, device=self.device)
         self.model.load()
-        self.model.apply_lora()
+        if not skip_lora:
+            self.model.apply_lora()
+        else:
+            logger.info("Skipping apply_lora() — checkpoint will provide LoRA weights")
 
         # Configure processor image resolution limits
         if hasattr(self.model.processor, "image_processor"):
@@ -669,13 +705,26 @@ def main():
 
     # Initialize trainer
     trainer = VLATrainer(config=config, device=args.device)
-    trainer.setup()
+
+    # When loading a checkpoint, skip apply_lora() in setup() to
+    # prevent double PeftModel wrapping (which causes OOM).
+    # load_lora() creates its own PeftModel wrapper.
+    trainer.setup(skip_lora=bool(args.checkpoint))
 
     # Load prior stage checkpoint if specified
     if args.checkpoint:
         log.info(f"Loading checkpoint: {args.checkpoint}")
         trainer.model.load_lora(args.checkpoint)
         log.info("Checkpoint loaded — continuing training from prior stage weights")
+
+        # Re-create optimizer with the newly loaded LoRA parameters
+        trainable_params = [p for p in trainer.model.model.parameters() if p.requires_grad]
+        trainer.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
+        )
+        log.info(f"Optimizer re-initialized with {len(trainable_params)} trainable params")
 
     # Run training stages (mutually exclusive)
     # Data is loaded per-stage to avoid doubling RAM usage.

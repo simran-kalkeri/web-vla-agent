@@ -33,9 +33,9 @@ def test_config():
     assert cfg.model.name == "Qwen/Qwen2-VL-2B-Instruct"
     assert cfg.model.lora_r == 16
     assert cfg.training.stage1_epochs == 5
-    assert cfg.training.stage2_epochs == 10
+    assert cfg.training.stage2_epochs == 3
     assert cfg.training.bf16 is True
-    assert cfg.data.max_dom_nodes == 500
+    assert cfg.data.max_dom_nodes == 120
     assert cfg.uncertainty.min_log_prob_threshold == -2.0
     assert cfg.environment.max_steps == 30
     print("PASS ✓")
