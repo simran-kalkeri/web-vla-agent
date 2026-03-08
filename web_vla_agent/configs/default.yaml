@@ -29,14 +29,14 @@ training:
   # Stage 1: Single-step imitation
   stage1_epochs: 5
   # Stage 2: Multi-step imitation
-  stage2_epochs: 10
+  stage2_epochs: 3
   # Stage 3 (optional): RL fine-tuning
   stage3_epochs: 0
 
   learning_rate: 2.0e-4
   weight_decay: 0.01
-  batch_size: 1
-  gradient_accumulation_steps: 8
+  batch_size: 2
+  gradient_accumulation_steps: 4
   warmup_ratio: 0.1
   max_grad_norm: 1.0
   seed: 42
@@ -55,9 +55,9 @@ training:
 
 data:
   dataset_name: "osunlp/Multimodal-Mind2Web"
-  max_dom_nodes: 500
+  max_dom_nodes: 120
   max_action_history: 10
-  max_text_per_node: 200
+  max_text_per_node: 80
   scroll_augmentation: true
   scroll_aug_ratio: 0.2
 
