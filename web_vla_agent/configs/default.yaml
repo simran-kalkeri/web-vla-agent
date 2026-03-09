@@ -59,7 +59,7 @@ data:
   max_action_history: 10
   max_text_per_node: 80
   scroll_augmentation: true
-  scroll_aug_ratio: 0.2
+  scroll_aug_ratio: 0.05
 
 environment:
   headless: true

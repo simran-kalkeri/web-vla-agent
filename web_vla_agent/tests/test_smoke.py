@@ -405,6 +405,44 @@ def test_candidate_format():
     print("PASS ✓")
 
 
+def test_inference_format_alignment():
+    """Inference candidates must NOT have bbox (matches training format)."""
+    print("  [13] Testing inference format alignment...", end=" ")
+    import asyncio
+    from inference.run_agent import VLAAgent
+    from utils.config import load_config
+
+    config = load_config()
+    agent = VLAAgent(config=config, use_mock=True)
+
+    async def run():
+        await agent.env.start()
+        state = await agent.env.reset("http://test.com")
+        candidates = agent._build_candidates_from_state(state, task="Click search")
+        await agent.env.close()
+        return candidates
+
+    candidates = asyncio.run(run())
+
+    # Candidates must exist
+    assert len(candidates) > 0, "No candidates generated from mock state"
+
+    # All candidates must have bbox=None (matches Mind2Web training format)
+    for c in candidates:
+        assert c.get("bbox") is None, (
+            f"Candidate {c.get('candidate_index')} has bbox={c.get('bbox')} — "
+            f"model was trained without bbox. Set bbox=None."
+        )
+
+    # All candidates must have required keys
+    required_keys = {"candidate_index", "tag", "text", "attributes", "node_id"}
+    for c in candidates:
+        missing = required_keys - set(c.keys())
+        assert not missing, f"Candidate missing keys: {missing}"
+
+    print(f"PASS ✓ ({len(candidates)} candidates, all bbox=None)")
+
+
 def main():
     print("=" * 60)
     print("  VLA Web Agent — Smoke Tests (Candidate-Based Architecture)")
@@ -426,6 +464,7 @@ def main():
         test_old_files_removed,
         test_new_files_exist,
         test_candidate_format,
+        test_inference_format_alignment,
     ]
 
     for test in tests:

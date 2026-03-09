@@ -191,17 +191,15 @@ class VLAAgent:
                 # Build candidate list from current DOM elements
                 candidates = self._build_candidates_from_state(state, task=task)
 
-                # Highlight candidates on screenshot for visual grounding
-                annotated_screenshot = None
-                if state.screenshot and candidates:
-                    annotated_screenshot = self._highlight_candidates(
-                        state.screenshot, candidates, state.viewport_info
-                    )
+                # NOTE: Visual highlighting is DISABLED.
+                # The model was trained on raw Mind2Web screenshots
+                # (no bounding box overlays). Annotating the screenshot
+                # introduces a vision distribution shift that causes the
+                # model to default to SCROLL.
 
-                # Generate action (use annotated screenshot)
+                # Generate action (use raw screenshot — matches training)
                 action_result = await self._generate_action(
                     state, task, candidates,
-                    screenshot_override=annotated_screenshot,
                 )
                 step_results.append(action_result)
 
@@ -236,16 +234,25 @@ class VLAAgent:
                 if action_str == previous_action_str:
                     duplicate_count += 1
                     if duplicate_count >= 2:
+                        # Only report success if at least one meaningful
+                        # action (CLICK/TYPE/SELECT) was taken.  Scrolling
+                        # 3× and auto-completing is NOT a success.
+                        meaningful = any(
+                            s.get("action", {}).get("action")
+                            in ("CLICK", "TYPE", "SELECT")
+                            for s in step_results
+                        )
+                        label = "✅" if meaningful else "⚠️"
                         logger.info(
                             f"Same action repeated {duplicate_count+1} times — "
-                            f"auto-completing task"
+                            f"auto-completing task (meaningful={meaningful})"
                         )
                         print(
-                            f"  ✅ Auto-DONE: same action repeated "
+                            f"  {label} Auto-DONE: same action repeated "
                             f"{duplicate_count+1} times"
                         )
                         return self._make_result(
-                            success=True,
+                            success=meaningful,
                             steps=step_results,
                             start_time=start_time,
                             url=state.url,
@@ -404,17 +411,21 @@ class VLAAgent:
         max_candidates = min(self.prompt_builder.max_candidates, 20)
         selected = scored[:max_candidates]
 
-        # ── Step 4: Build candidate dicts with bbox ───────────
+        # ── Step 4: Build candidate dicts ────────────────────
+        # NOTE: bbox is intentionally set to None.
+        # The model was trained on Mind2Web candidates which have NO
+        # bounding box data. Including bbox causes the prompt builder
+        # to append "at (x,y WxH)" text the model never learned,
+        # creating a format mismatch that causes SCROLL-only output.
         candidates = []
         for i, (score, el) in enumerate(selected):
-            bbox = el.get("bbox", [0, 0, 0, 0])
             candidates.append({
                 "candidate_index": i,
                 "tag": el.get("tag", "div"),
                 "text": str(el.get("text", ""))[:200],
                 "attributes": el.get("attributes", {}),
                 "node_id": el.get("node_id", -1),
-                "bbox": bbox,
+                "bbox": None,
                 "score": score,
             })
 
@@ -427,7 +438,7 @@ class VLAAgent:
                     "text": str(el.get("text", ""))[:200],
                     "attributes": el.get("attributes", {}),
                     "node_id": el.get("node_id", -1),
-                    "bbox": el.get("bbox", [0, 0, 0, 0]),
+                    "bbox": None,
                     "score": 0,
                 })
 
