@@ -419,11 +419,26 @@ class VLAAgent:
         # creating a format mismatch that causes SCROLL-only output.
         candidates = []
         for i, (score, el) in enumerate(selected):
+            # Semantic text extraction: fall back to common DOM
+            # attributes when inner text is empty.  This matches
+            # Mind2Web training format where candidates always
+            # carried meaningful labels.
+            attrs = el.get("attributes", {})
+            text = (
+                el.get("text", "")
+                or attrs.get("placeholder", "")
+                or attrs.get("aria-label", "")
+                or attrs.get("title", "")
+                or attrs.get("name", "")
+                or attrs.get("value", "")
+            )
+            text = str(text)[:200]
+
             candidates.append({
                 "candidate_index": i,
                 "tag": el.get("tag", "div"),
-                "text": str(el.get("text", ""))[:200],
-                "attributes": el.get("attributes", {}),
+                "text": text,
+                "attributes": attrs,
                 "node_id": el.get("node_id", -1),
                 "bbox": None,
                 "score": score,
@@ -432,15 +447,40 @@ class VLAAgent:
         if not candidates and interactable:
             # Fallback: keep first 20 interactable without scoring
             for i, el in enumerate(interactable[:20]):
+                attrs = el.get("attributes", {})
+                text = (
+                    el.get("text", "")
+                    or attrs.get("placeholder", "")
+                    or attrs.get("aria-label", "")
+                    or attrs.get("title", "")
+                    or attrs.get("name", "")
+                    or attrs.get("value", "")
+                )
+                text = str(text)[:200]
+
                 candidates.append({
                     "candidate_index": i,
                     "tag": el.get("tag", "div"),
-                    "text": str(el.get("text", ""))[:200],
-                    "attributes": el.get("attributes", {}),
+                    "text": text,
+                    "attributes": attrs,
                     "node_id": el.get("node_id", -1),
                     "bbox": None,
                     "score": 0,
                 })
+
+        # Debug: print candidate summary for verification
+        print("\n===== CANDIDATES =====")
+        for c in candidates:
+            attrs = c.get("attributes", {})
+            print(
+                f"[{c['candidate_index']}] "
+                f"{c['tag']} "
+                f"text='{c['text']}' "
+                f"placeholder='{attrs.get('placeholder', '')}' "
+                f"name='{attrs.get('name', '')}' "
+                f"aria='{attrs.get('aria-label', '')}'"
+            )
+        print("======================\n")
 
         return candidates
 
