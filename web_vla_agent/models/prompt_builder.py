@@ -190,7 +190,20 @@ class PromptBuilder:
         self.max_candidates = max_candidates
         self.max_history_entries = max_history_entries
 
-    # ── Candidate formatting ──────────────────────────────────
+    # Tag display names for cleaner prompt format
+    _TAG_DISPLAY = {
+        "a": "LINK",
+        "button": "BUTTON",
+        "input": "INPUT",
+        "textarea": "TEXTAREA",
+        "select": "SELECT",
+        "option": "OPTION",
+        "label": "LABEL",
+        "summary": "SUMMARY",
+        "img": "IMAGE",
+        "div": "DIV",
+        "span": "SPAN",
+    }
 
     @staticmethod
     def format_candidate(
@@ -198,17 +211,22 @@ class PromptBuilder:
         tag: str,
         text: str = "",
         attributes: Optional[Dict[str, str]] = None,
+        bbox: Optional[List[float]] = None,
     ) -> str:
         """
         Format a single candidate element for the prompt.
 
+        Uses semantic uppercase tag names and includes position.
         Example output:
-            [3] <button> "Search Flights" role=tab id=search-btn
+            [3] BUTTON "Search Flights" at (640,45 120x32) role=tab id=search-btn
         """
+        # Semantic tag name
+        display_tag = PromptBuilder._TAG_DISPLAY.get(tag.lower(), tag.upper())
+
         attrs = attributes or {}
         # Keep only useful attributes
         keep = {"role", "type", "placeholder", "aria-label", "href",
-                "name", "value", "title", "alt", "id", "class", "for"}
+                "name", "value", "title", "alt", "id", "for"}
         attr_parts = []
         for k, v in sorted(attrs.items()):
             if k in keep and v:
@@ -216,7 +234,18 @@ class PromptBuilder:
         attr_str = " ".join(attr_parts)
 
         text_str = f' "{text[:80]}"' if text else ""
-        return f"[{index}] <{tag}>{text_str} {attr_str}".strip()
+
+        # Position info from bounding box
+        pos_str = ""
+        if bbox and len(bbox) >= 4:
+            x, y, w, h = [int(v) for v in bbox[:4]]
+            if w > 0 and h > 0:
+                pos_str = f" at ({x},{y} {w}x{h})"
+
+        parts = [f"[{index}] {display_tag}{text_str}{pos_str}"]
+        if attr_str:
+            parts.append(attr_str)
+        return " ".join(parts)
 
     @staticmethod
     def format_candidate_list(candidates: List[Dict[str, Any]]) -> str:
@@ -228,6 +257,7 @@ class PromptBuilder:
           - tag: str
           - text: str (optional)
           - attributes: dict (optional)
+          - bbox: list (optional) — [x, y, w, h]
         """
         lines = []
         for c in candidates:
@@ -236,6 +266,7 @@ class PromptBuilder:
                 tag=c.get("tag", "div"),
                 text=c.get("text", ""),
                 attributes=c.get("attributes"),
+                bbox=c.get("bbox"),
             )
             lines.append(line)
         return "\n".join(lines)

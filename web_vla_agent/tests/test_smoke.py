@@ -173,7 +173,7 @@ def test_prompt_builder():
     # Format candidate
     line = PromptBuilder.format_candidate(0, "button", "Search", {"role": "tab"})
     assert "[0]" in line
-    assert "<button>" in line
+    assert "BUTTON" in line
     assert "Search" in line
     print("PASS ✓")
 
@@ -388,7 +388,7 @@ def test_candidate_format():
         attributes={"role": "tab", "id": "submit-btn"},
     )
     assert "[3]" in line
-    assert "<button>" in line
+    assert "BUTTON" in line
     assert "Submit Flight Search" in line
     assert 'role="tab"' in line
 
@@ -400,8 +400,8 @@ def test_candidate_format():
     text = PromptBuilder.format_candidate_list(candidates)
     assert "[0]" in text
     assert "[1]" in text
-    assert "<button>" in text
-    assert "<input>" in text
+    assert "BUTTON" in text
+    assert "INPUT" in text
     print("PASS ✓")
 
 

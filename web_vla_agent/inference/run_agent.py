@@ -26,8 +26,29 @@ from models.uncertainty import TokenUncertainty
 from environment.playwright_env import BrowserEnvironment, BrowserState, WebAction
 from memory.failure_detector import FailureDetector, FailureType
 from utils.config import VLAConfig, load_config
+from PIL import ImageDraw
 
 logger = logging.getLogger(__name__)
+
+# ── Interactable element filters ─────────────────────────────
+
+INTERACTABLE_TAGS = {
+    "button", "input", "textarea", "select", "a",
+    "option", "label", "summary",
+}
+INTERACTABLE_ROLES = {
+    "button", "link", "menuitem", "tab", "checkbox", "radio",
+    "switch", "option", "combobox", "searchbox", "textbox",
+    "listbox", "slider", "spinbutton", "treeitem",
+}
+
+# Common stop words to ignore when matching task to candidates
+_STOP_WORDS = {
+    "the", "a", "an", "in", "on", "to", "of", "and", "or", "for",
+    "is", "it", "at", "by", "from", "into", "then", "click",
+    "type", "select", "scroll", "search", "find", "go", "open",
+    "press", "enter", "submit", "field", "button", "page",
+}
 
 
 class VLAAgent:
@@ -168,11 +189,19 @@ class VLAAgent:
                     )
 
                 # Build candidate list from current DOM elements
-                candidates = self._build_candidates_from_state(state)
+                candidates = self._build_candidates_from_state(state, task=task)
 
-                # Generate action
+                # Highlight candidates on screenshot for visual grounding
+                annotated_screenshot = None
+                if state.screenshot and candidates:
+                    annotated_screenshot = self._highlight_candidates(
+                        state.screenshot, candidates, state.viewport_info
+                    )
+
+                # Generate action (use annotated screenshot)
                 action_result = await self._generate_action(
-                    state, task, candidates
+                    state, task, candidates,
+                    screenshot_override=annotated_screenshot,
                 )
                 step_results.append(action_result)
 
@@ -310,35 +339,193 @@ class VLAAgent:
     def _build_candidates_from_state(
         self,
         state: BrowserState,
+        task: str = "",
     ) -> List[Dict[str, Any]]:
         """
-        Build a candidate list from the browser state's DOM elements.
+        Build a filtered, scored candidate list from browser state.
 
-        Each candidate gets a sequential index (0, 1, 2, ...) and
-        maps to the original DOM node_id for action execution.
+        Pipeline:
+        1. Filter to interactable + visible elements only
+        2. Score by task-text similarity (word overlap)
+        3. Sort by score (best matches first)
+        4. Keep top N candidates
+        5. Enrich with bounding box data
         """
-        candidates = []
-
-        # Prefer interactable elements, but include all visible ones
         elements = state.dom_elements or []
 
-        # Sort: interactable first
-        interactable = [e for e in elements if e.get("is_interactable")]
-        non_interactable = [e for e in elements if not e.get("is_interactable")]
-        sorted_elements = interactable + non_interactable
+        # ── Step 1: Filter to interactable only ──────────────
+        interactable = []
+        for el in elements:
+            if not el.get("is_visible", True):
+                continue
 
-        # Limit to prevent prompt overflow
-        max_candidates = self.prompt_builder.max_candidates
-        for i, el in enumerate(sorted_elements[:max_candidates]):
+            tag = el.get("tag", "").lower()
+            role = el.get("attributes", {}).get("role", "").lower()
+
+            is_ok = (
+                tag in INTERACTABLE_TAGS
+                or role in INTERACTABLE_ROLES
+                or el.get("is_interactable", False)
+            )
+            if is_ok:
+                interactable.append(el)
+
+        # ── Step 2: Score by task similarity ──────────────────
+        task_words = {
+            w.lower()
+            for w in task.split()
+            if len(w) > 2 and w.lower() not in _STOP_WORDS
+        }
+
+        scored = []
+        for el in interactable:
+            # Build searchable text from element
+            parts = [el.get("text", "")]
+            attrs = el.get("attributes", {})
+            for key in ("placeholder", "aria-label", "title", "name", "value", "alt"):
+                if key in attrs:
+                    parts.append(attrs[key])
+            el_text = " ".join(parts).lower()
+
+            # Word overlap score
+            score = sum(1 for w in task_words if w in el_text)
+
+            # Boost input/textarea for TYPE tasks
+            tag = el.get("tag", "").lower()
+            if tag in ("input", "textarea") and any(
+                w in task.lower() for w in ("type", "enter", "write", "input", "fill")
+            ):
+                score += 3
+
+            scored.append((score, el))
+
+        # ── Step 3: Sort and limit ────────────────────────────
+        scored.sort(key=lambda x: x[0], reverse=True)
+        max_candidates = min(self.prompt_builder.max_candidates, 20)
+        selected = scored[:max_candidates]
+
+        # ── Step 4: Build candidate dicts with bbox ───────────
+        candidates = []
+        for i, (score, el) in enumerate(selected):
+            bbox = el.get("bbox", [0, 0, 0, 0])
             candidates.append({
                 "candidate_index": i,
                 "tag": el.get("tag", "div"),
                 "text": str(el.get("text", ""))[:200],
                 "attributes": el.get("attributes", {}),
                 "node_id": el.get("node_id", -1),
+                "bbox": bbox,
+                "score": score,
             })
 
+        if not candidates and interactable:
+            # Fallback: keep first 20 interactable without scoring
+            for i, el in enumerate(interactable[:20]):
+                candidates.append({
+                    "candidate_index": i,
+                    "tag": el.get("tag", "div"),
+                    "text": str(el.get("text", ""))[:200],
+                    "attributes": el.get("attributes", {}),
+                    "node_id": el.get("node_id", -1),
+                    "bbox": el.get("bbox", [0, 0, 0, 0]),
+                    "score": 0,
+                })
+
         return candidates
+
+    # ── Visual highlighting ──────────────────────────────────
+
+    def _highlight_candidates(
+        self,
+        screenshot: Image.Image,
+        candidates: List[Dict[str, Any]],
+        viewport_info: Dict[str, Any],
+    ) -> Image.Image:
+        """
+        Draw bounding boxes and index labels on the screenshot
+        for each candidate element. Returns a new annotated image.
+        """
+        img = screenshot.copy()
+        draw = ImageDraw.Draw(img)
+
+        sx = viewport_info.get("scrollX", 0)
+        sy = viewport_info.get("scrollY", 0)
+
+        # Color palette for different element types
+        tag_colors = {
+            "input": "#FF4444",
+            "textarea": "#FF4444",
+            "button": "#4444FF",
+            "a": "#44AA44",
+            "select": "#FF8800",
+        }
+
+        for c in candidates:
+            bbox = c.get("bbox", [0, 0, 0, 0])
+            x, y, w, h = bbox
+
+            # Adjust for scroll offset (bbox is page-relative)
+            x1 = x - sx
+            y1 = y - sy
+            x2 = x1 + w
+            y2 = y1 + h
+
+            # Skip elements outside viewport
+            if x2 < 0 or y2 < 0 or x1 > img.width or y1 > img.height:
+                continue
+
+            tag = c.get("tag", "").lower()
+            color = tag_colors.get(tag, "#FF0000")
+
+            # Draw rectangle
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+            # Draw index label
+            idx = c.get("candidate_index", "?")
+            label = str(idx)
+            label_y = max(0, y1 - 14)
+            draw.rectangle([x1, label_y, x1 + 18, label_y + 14], fill=color)
+            draw.text((x1 + 2, label_y), label, fill="white")
+
+        return img
+
+    # ── Action masking ───────────────────────────────────────
+
+    @staticmethod
+    def _mask_action(
+        action: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Mask impossible actions based on available candidates.
+
+        - TYPE without input/textarea → CLICK
+        - SELECT without select → CLICK
+        - Candidate index out of range → clamp
+        """
+        action_type = action.get("action", "")
+        input_tags = {"input", "textarea"}
+        has_inputs = any(c.get("tag", "").lower() in input_tags for c in candidates)
+        has_selects = any(c.get("tag", "").lower() == "select" for c in candidates)
+
+        if action_type == "TYPE" and not has_inputs:
+            logger.info("  Action mask: TYPE → CLICK (no input fields)")
+            action["action"] = "CLICK"
+            action.pop("value", None)
+
+        if action_type == "SELECT" and not has_selects:
+            logger.info("  Action mask: SELECT → CLICK (no select fields)")
+            action["action"] = "CLICK"
+            action.pop("value", None)
+
+        # Clamp candidate index
+        if "candidate" in action and candidates:
+            idx = action["candidate"]
+            if isinstance(idx, int) and idx >= len(candidates):
+                action["candidate"] = len(candidates) - 1
+                logger.info(f"  Action mask: clamped candidate {idx} → {action['candidate']}")
+
+        return action
 
     def _candidate_to_web_action(
         self,
@@ -406,25 +593,30 @@ class VLAAgent:
         state: BrowserState,
         task: str,
         candidates: List[Dict[str, Any]],
+        screenshot_override: Optional[Image.Image] = None,
     ) -> Dict[str, Any]:
         """
         Generate and validate an action for the current state.
 
         Uses uncertainty estimation and regeneration if needed.
+        screenshot_override: annotated screenshot with visual highlights.
         """
+        # Use annotated screenshot if provided (has bounding boxes drawn)
+        screenshot_to_use = screenshot_override or state.screenshot
+
         # Build prompt with candidate list
         extra_context = f"URL: {state.url}\nPage: {state.page_title}"
         messages = self.prompt_builder.build_chat_messages(
             task=task,
             candidates=candidates,
             action_history=state.action_history,
-            screenshot_placeholder=state.screenshot is not None,
+            screenshot_placeholder=screenshot_to_use is not None,
             extra_context=extra_context,
         )
 
         # Debug
         num_cands = len(candidates)
-        img_size = state.screenshot.size if state.screenshot else None
+        img_size = screenshot_to_use.size if screenshot_to_use else None
         print(
             f"  [DEBUG] Candidates: {num_cands}, "
             f"Screenshot: {img_size}"
@@ -434,7 +626,7 @@ class VLAAgent:
         start = time.time()
         result = self.model.generate(
             messages=messages,
-            image=state.screenshot,
+            image=screenshot_to_use,
             return_log_probs=True,
         )
         latency_ms = (time.time() - start) * 1000
@@ -457,7 +649,7 @@ class VLAAgent:
             for attempt in range(self.uncertainty.max_regenerations):
                 result = self.model.generate(
                     messages=messages,
-                    image=state.screenshot,
+                    image=screenshot_to_use,
                     temperature=0.3 + attempt * 0.1,
                     return_log_probs=True,
                 )
@@ -471,6 +663,10 @@ class VLAAgent:
                         f"  Regeneration {attempt + 1} succeeded"
                     )
                     break
+
+        # Apply action masking (prevent impossible actions)
+        if is_valid and action is not None:
+            action = self._mask_action(action, candidates)
 
         if not is_valid:
             logger.warning(f"  Invalid action: {error}")
