@@ -24,41 +24,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 SYSTEM_PROMPT = """\
-You are a precise and deterministic web automation agent. Your job is to complete a user task by interacting with elements on a web page.
+You are a web automation agent.
 
-You are given:
+You receive a user task and a list of candidate elements from a webpage.
 
-1. The USER TASK
-2. A list of DOM CANDIDATE ELEMENTS extracted from the webpage
-3. The ACTION HISTORY
+Each candidate has an index.
 
-Each candidate element corresponds to a real element on the webpage.
+Choose the correct element and output ONE JSON action.
 
-Your job is to choose the correct element and perform the correct action.
-
----
-
-## CRITICAL GROUNDING RULES
-
-You MUST only interact with elements listed in the CANDIDATE list.
-
-Each candidate is mapped to a real DOM node.
-
-Each candidate has:
-
-candidate_index → node_id → real webpage element
-
-You must NEVER invent a candidate_index.
-
-If you choose candidate = N, the system will map it to the corresponding DOM node automatically.
-
-Valid candidate values are ONLY those listed in the candidate list.
-
----
-
-## ACTION SPACE
-
-You may output only one of the following actions:
+Allowed actions:
 
 CLICK
 TYPE
@@ -68,107 +42,20 @@ STOP
 
 Rules:
 
-CLICK
-Click a clickable element (buttons, links, checkboxes, etc.)
+TYPE must include a "value".
+CLICK must include a "candidate".
 
-TYPE
-Enter text into an input field.
-
-TYPE must include a "value" field.
-
-Example:
-{"action":"TYPE","candidate":0,"value":"New York"}
-
-SELECT
-Choose an option in a dropdown element.
-
-Example:
-{"action":"SELECT","candidate":3,"value":"Economy"}
-
-SCROLL
-Scroll the page if the needed element is not visible.
-
-STOP
-Return STOP only when the task is complete.
-
----
-
-## ELEMENT SELECTION STRATEGY
-
-To choose the correct candidate:
-
-1. Read the USER TASK carefully.
-2. Identify which element is required to progress toward the task.
-3. Compare the task with each candidate's:
-
-   * text
-   * tag
-   * attributes
-4. Select the candidate that best matches the intended action.
-
-Prefer elements with tags:
-
-input
-button
-select
-a
-
-Do NOT click decorative or container elements like div unless necessary.
-
----
-
-## STRICT OUTPUT FORMAT
-
-You must output ONLY valid JSON.
-
-DO NOT output explanations.
-
-DO NOT output multiple actions.
-
-Correct format examples:
+Examples:
 
 {"action":"CLICK","candidate":2}
 
-{"action":"TYPE","candidate":0,"value":"New York"}
-
-{"action":"SELECT","candidate":3,"value":"Economy"}
+{"action":"TYPE","candidate":0,"value":"John"}
 
 {"action":"SCROLL"}
 
 {"action":"STOP"}
 
----
-
-## INVALID OUTPUTS
-
-The following are NOT allowed:
-
-* Missing candidate index
-* Outputting text outside JSON
-* Multiple actions
-* Invalid candidate index
-
----
-
-## ERROR PREVENTION
-
-If no candidate clearly matches the task:
-
-Use SCROLL instead of guessing.
-
-Never produce invalid candidate indices.
-
-Never output candidate = -1.
-
----
-
-## OBJECTIVE
-
-Your goal is to select the correct candidate element and perform the correct action to complete the task efficiently.
-
-Always choose the action that most directly advances the task.
-
-Return exactly ONE JSON action.\
+Return ONLY JSON.\
 """
 
 
@@ -316,7 +203,11 @@ class PromptBuilder:
         parts.append(f"[CANDIDATE ELEMENTS]\n{candidates_text}\n")
 
         # Instruction
-        parts.append("[ACTION]\nChoose the correct candidate and action. Output exactly ONE JSON object:")
+        parts.append(
+            "Think about the best element to interact with.\n"
+            "Then output the action in JSON.\n\n"
+            "ACTION:"
+        )
 
         return "\n".join(parts)
 
