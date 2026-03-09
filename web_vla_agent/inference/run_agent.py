@@ -54,6 +54,7 @@ class VLAAgent:
         self.config = config or load_config()
         self.device = device
         self.use_mock = use_mock
+        self.output_dir = None   # Set externally for screenshot saving
 
         self.model = None
         self.prompt_builder = PromptBuilder()
@@ -123,6 +124,8 @@ class VLAAgent:
         max_steps = max_steps or self.config.environment.max_steps
         start_time = time.time()
         step_results = []
+        previous_action_str = ""    # Track duplicate actions
+        duplicate_count = 0
 
         # Start browser and navigate
         await self.env.start()
@@ -131,9 +134,11 @@ class VLAAgent:
             self.failure_detector.reset()
             prev_state_dict: dict | None = None
 
-            # Save initial screenshot for debugging
-            if state.screenshot:
-                state.screenshot.save("debug_step_0.png")
+            # Save initial screenshot
+            if state.screenshot and self.output_dir:
+                path = self.output_dir / "step_00_initial.png"
+                state.screenshot.save(str(path))
+                print(f"  📸 Saved: {path}")
 
             logger.info(f"Task: {task}")
             logger.info(f"URL: {url}")
@@ -195,6 +200,31 @@ class VLAAgent:
                         url=state.url,
                     )
 
+                # ── Duplicate action detection ───────────────────
+                # If the model generates the same action twice in a
+                # row, the task is likely complete. Auto-DONE.
+                action_str = json.dumps(action, sort_keys=True)
+                if action_str == previous_action_str:
+                    duplicate_count += 1
+                    if duplicate_count >= 2:
+                        logger.info(
+                            f"Same action repeated {duplicate_count+1} times — "
+                            f"auto-completing task"
+                        )
+                        print(
+                            f"  ✅ Auto-DONE: same action repeated "
+                            f"{duplicate_count+1} times"
+                        )
+                        return self._make_result(
+                            success=True,
+                            steps=step_results,
+                            start_time=start_time,
+                            url=state.url,
+                        )
+                else:
+                    duplicate_count = 0
+                previous_action_str = action_str
+
                 # ── Handle SCROLL action ─────────────────────────
                 if action.get("action") == "SCROLL":
                     direction = action.get("direction", "down")
@@ -228,9 +258,14 @@ class VLAAgent:
                     f"  → Page: {new_state.page_title} URL: {new_state.url}"
                 )
 
-                # Save step screenshot for debugging
-                if new_state.screenshot:
-                    new_state.screenshot.save(f"debug_step_{step+1}.png")
+                # Save step screenshot
+                if new_state.screenshot and self.output_dir:
+                    action_type = action.get('action', 'UNK')
+                    candidate = action.get('candidate', '?')
+                    fname = f"step_{step+1:02d}_{action_type}_c{candidate}.png"
+                    path = self.output_dir / fname
+                    new_state.screenshot.save(str(path))
+                    print(f"  📸 Saved: {path}")
 
                 # Failure detection
                 curr_state_dict = {
@@ -485,17 +520,29 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--mock", action="store_true", help="Use mock browser")
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--output-dir", type=str, default="inference_output",
+                        help="Directory to save step screenshots (default: inference_output)")
     args = parser.parse_args()
 
     from utils.logging import get_logger
     log = get_logger("vla.agent")
 
     config = load_config(args.config)
+
+    # Setup output directory for screenshots
+    output_dir = None
+    if args.output_dir:
+        from pathlib import Path
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Screenshots will be saved to: {output_dir}")
+
     agent = VLAAgent(
         config=config,
         device=args.device,
         use_mock=args.mock,
     )
+    agent.output_dir = output_dir
     agent.load_model(checkpoint=args.checkpoint)
 
     result = asyncio.run(agent.run_task(
