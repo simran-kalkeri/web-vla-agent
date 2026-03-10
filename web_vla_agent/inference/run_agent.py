@@ -11,12 +11,20 @@ Features:
   - Max steps + failure detection
   - Action validation against candidate list
   - Detailed logging
+  - C1 FIX: Shuffle candidates after scoring to match training distribution
+  - S6 FIX: _scroll_attempts initialized and reset properly
+  - M2 FIX: Action masking accounts for contenteditable, role='textbox'
+  - I1: DOM context passed in prompt
+  - I2: Semantic candidate ranking (optional)
+  - I4: Bounding boxes restored in candidates
+  - I5: Planning layer integration
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -26,7 +34,7 @@ from models.uncertainty import TokenUncertainty
 from environment.playwright_env import BrowserEnvironment, BrowserState, WebAction
 from memory.failure_detector import FailureDetector, FailureType
 from utils.config import VLAConfig, load_config
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +86,9 @@ class VLAAgent:
         self.output_dir = None   # Set externally for screenshot saving
 
         self.model = None
-        self.prompt_builder = PromptBuilder()
+        self.prompt_builder = PromptBuilder(
+            max_candidates=getattr(self.config.data, 'max_candidates', 64),
+        )
         self.action_decoder = ActionDecoder()
         self.uncertainty = TokenUncertainty(
             min_log_prob=self.config.uncertainty.min_log_prob_threshold,
@@ -99,6 +109,16 @@ class VLAAgent:
             stale_threshold=3,
             max_steps=self.config.environment.max_steps,
         )
+
+        # S6 FIX: Initialize _scroll_attempts in __init__
+        self._scroll_attempts = 0
+
+        # I2: Optional semantic candidate ranker
+        self._candidate_ranker = None
+
+        # I5: Optional planning layer
+        self._task_planner = None
+        self._subgoals: List[str] = []
 
     def load_model(self, checkpoint: Optional[str] = None) -> None:
         """Load the VLA model and optionally LoRA weights."""
@@ -148,12 +168,19 @@ class VLAAgent:
         previous_action_str = ""    # Track duplicate actions
         duplicate_count = 0
 
+        # S6 FIX: Reset scroll attempts at task start
+        self._scroll_attempts = 0
+
         # Start browser and navigate
         await self.env.start()
         try:
             state = await self.env.reset(url)
             self.failure_detector.reset()
             prev_state_dict: dict | None = None
+
+            # I5: Generate planning subgoals
+            if self._task_planner:
+                self._subgoals = self._task_planner.plan(task, url)
 
             # Save initial screenshot
             if state.screenshot and self.output_dir:
@@ -191,15 +218,21 @@ class VLAAgent:
                 # Build candidate list from current DOM elements
                 candidates = self._build_candidates_from_state(state, task=task)
 
-                # NOTE: Visual highlighting is DISABLED.
-                # The model was trained on raw Mind2Web screenshots
-                # (no bounding box overlays). Annotating the screenshot
-                # introduces a vision distribution shift that causes the
-                # model to default to SCROLL.
+                # I5: Get current subgoal context
+                subgoal_context = ""
+                if self._subgoals:
+                    from models.task_planner import TaskPlanner
+                    planner = TaskPlanner(self.model, self.prompt_builder)
+                    subgoal = planner.get_current_subgoal(
+                        self._subgoals, step, max_steps
+                    )
+                    if subgoal and subgoal != task:
+                        subgoal_context = f"Current subgoal: {subgoal}"
 
                 # Generate action (use raw screenshot — matches training)
                 action_result = await self._generate_action(
                     state, task, candidates,
+                    subgoal_context=subgoal_context,
                 )
                 step_results.append(action_result)
 
@@ -228,15 +261,10 @@ class VLAAgent:
                     )
 
                 # ── Duplicate action detection ───────────────────
-                # If the model generates the same action twice in a
-                # row, the task is likely complete. Auto-DONE.
                 action_str = json.dumps(action, sort_keys=True)
                 if action_str == previous_action_str:
                     duplicate_count += 1
                     if duplicate_count >= 2:
-                        # Only report success if at least one meaningful
-                        # action (CLICK/TYPE/SELECT) was taken.  Scrolling
-                        # 3× and auto-completing is NOT a success.
                         meaningful = any(
                             s.get("action", {}).get("action")
                             in ("CLICK", "TYPE", "SELECT")
@@ -278,7 +306,6 @@ class VLAAgent:
                 # Map candidate index → node_id for execution
                 web_action = self._candidate_to_web_action(action, candidates)
                 if web_action is None:
-                    # Can't map candidate — try auto-scroll as fallback
                     auto_scrolled = await self._auto_scroll_fallback(state)
                     if auto_scrolled:
                         state = await self.env.extract_state()
@@ -353,12 +380,14 @@ class VLAAgent:
 
         Pipeline:
         1. Filter to interactable + visible elements only
-        2. Score by task-text similarity (word overlap)
+        2. Score by task-text similarity (word overlap or I2 semantic)
         3. Sort by score (best matches first)
         4. Keep top N candidates
-        5. Enrich with bounding box data
+        5. I4: Include bounding box data
+        6. C1 FIX: Shuffle after scoring to match training distribution
         """
         elements = state.dom_elements or []
+        max_candidates = getattr(self.config.data, 'max_candidates', 64)
 
         # ── Step 1: Filter to interactable only ──────────────
         interactable = []
@@ -408,21 +437,11 @@ class VLAAgent:
 
         # ── Step 3: Sort and limit ────────────────────────────
         scored.sort(key=lambda x: x[0], reverse=True)
-        max_candidates = min(self.prompt_builder.max_candidates, 20)
         selected = scored[:max_candidates]
 
         # ── Step 4: Build candidate dicts ────────────────────
-        # NOTE: bbox is intentionally set to None.
-        # The model was trained on Mind2Web candidates which have NO
-        # bounding box data. Including bbox causes the prompt builder
-        # to append "at (x,y WxH)" text the model never learned,
-        # creating a format mismatch that causes SCROLL-only output.
         candidates = []
         for i, (score, el) in enumerate(selected):
-            # Semantic text extraction: fall back to common DOM
-            # attributes when inner text is empty.  This matches
-            # Mind2Web training format where candidates always
-            # carried meaningful labels.
             attrs = el.get("attributes", {})
             text = (
                 el.get("text", "")
@@ -434,19 +453,23 @@ class VLAAgent:
             )
             text = str(text)[:200]
 
+            # I4: Restore bounding box for spatial grounding
+            bbox = el.get("bbox")
+
             candidates.append({
                 "candidate_index": i,
                 "tag": el.get("tag", "div"),
                 "text": text,
                 "attributes": attrs,
                 "node_id": el.get("node_id", -1),
-                "bbox": None,
+                "backend_node_id": el.get("node_id", -1),  # C4: for evaluation
+                "bbox": bbox,       # I4: restored
                 "score": score,
             })
 
         if not candidates and interactable:
-            # Fallback: keep first 20 interactable without scoring
-            for i, el in enumerate(interactable[:20]):
+            # Fallback: keep first N interactable without scoring
+            for i, el in enumerate(interactable[:max_candidates]):
                 attrs = el.get("attributes", {})
                 text = (
                     el.get("text", "")
@@ -458,15 +481,29 @@ class VLAAgent:
                 )
                 text = str(text)[:200]
 
+                bbox = el.get("bbox")
+
                 candidates.append({
                     "candidate_index": i,
                     "tag": el.get("tag", "div"),
                     "text": text,
                     "attributes": attrs,
                     "node_id": el.get("node_id", -1),
-                    "bbox": None,
+                    "backend_node_id": el.get("node_id", -1),
+                    "bbox": bbox,
                     "score": 0,
                 })
+
+        # ── C1 FIX: Shuffle after scoring to match training distribution ──
+        # During training, candidates are shuffled randomly. Without shuffling
+        # at inference, the model always sees highest-scoring candidates first,
+        # creating a distribution mismatch. We shuffle AFTER limiting to top-N
+        # so the model sees the same kind of random ordering it learned from.
+        random.shuffle(candidates)
+
+        # Re-index after shuffle
+        for i, c in enumerate(candidates):
+            c["candidate_index"] = i
 
         # Debug: print candidate summary for verification
         print("\n===== CANDIDATES =====")
@@ -512,7 +549,9 @@ class VLAAgent:
         }
 
         for c in candidates:
-            bbox = c.get("bbox", [0, 0, 0, 0])
+            bbox = c.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
             x, y, w, h = bbox
 
             # Adjust for scroll offset (bbox is page-relative)
@@ -550,17 +589,24 @@ class VLAAgent:
         """
         Mask impossible actions based on available candidates.
 
-        - TYPE without input/textarea → CLICK
-        - SELECT without select → CLICK
-        - Candidate index out of range → clamp
+        M2 FIX: Expanded to account for contenteditable divs and
+        role='textbox' in addition to <input> and <textarea> tags.
         """
         action_type = action.get("action", "")
-        input_tags = {"input", "textarea"}
-        has_inputs = any(c.get("tag", "").lower() in input_tags for c in candidates)
+
+        # M2 FIX: Expanded type-able element detection
+        typeable_tags = {"input", "textarea"}
+        typeable_roles = {"textbox", "searchbox", "combobox"}
+        has_typeable = any(
+            c.get("tag", "").lower() in typeable_tags
+            or c.get("attributes", {}).get("role", "").lower() in typeable_roles
+            or c.get("attributes", {}).get("contenteditable", "").lower() in ("true", "")
+            for c in candidates
+        )
         has_selects = any(c.get("tag", "").lower() == "select" for c in candidates)
 
-        if action_type == "TYPE" and not has_inputs:
-            logger.info("  Action mask: TYPE → CLICK (no input fields)")
+        if action_type == "TYPE" and not has_typeable:
+            logger.info("  Action mask: TYPE → CLICK (no typeable fields)")
             action["action"] = "CLICK"
             action.pop("value", None)
 
@@ -608,14 +654,12 @@ class VLAAgent:
         Auto-scroll the page as a fallback when the model can't find
         a valid candidate.
 
-        Returns True if scroll was executed, False if max attempts reached.
+        S6 FIX: _scroll_attempts is now properly initialized in __init__
+        and reset at the start of run_task().
         """
         max_scroll_attempts = getattr(
             self.config.environment, "max_scroll_attempts", 3
         )
-
-        if not hasattr(self, "_scroll_attempts"):
-            self._scroll_attempts = 0
 
         if self._scroll_attempts >= max_scroll_attempts:
             logger.info(
@@ -645,24 +689,33 @@ class VLAAgent:
         task: str,
         candidates: List[Dict[str, Any]],
         screenshot_override: Optional[Image.Image] = None,
+        subgoal_context: str = "",
     ) -> Dict[str, Any]:
         """
         Generate and validate an action for the current state.
 
         Uses uncertainty estimation and regeneration if needed.
-        screenshot_override: annotated screenshot with visual highlights.
         """
-        # Use annotated screenshot if provided (has bounding boxes drawn)
+        # Use annotated screenshot if provided
         screenshot_to_use = screenshot_override or state.screenshot
+
+        # I1: Build DOM context from interactable nodes only
+        dom_context = ""
+        if state.serialized_dom:
+            dom_context = state.serialized_dom
 
         # Build prompt with candidate list
         extra_context = f"URL: {state.url}\nPage: {state.page_title}"
+        if subgoal_context:
+            extra_context += f"\n{subgoal_context}"
+
         messages = self.prompt_builder.build_chat_messages(
             task=task,
             candidates=candidates,
             action_history=state.action_history,
             screenshot_placeholder=screenshot_to_use is not None,
             extra_context=extra_context,
+            dom_context=dom_context,      # I1
         )
 
         # Debug: print full prompt for verification
@@ -677,6 +730,7 @@ class VLAAgent:
             candidates=candidates,
             action_history=state.action_history,
             extra_context=extra_context,
+            dom_context=dom_context,
         )
         print(f"\n===== FULL PROMPT =====")
         print(text_prompt)

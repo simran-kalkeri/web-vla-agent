@@ -23,6 +23,9 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# FIX S5: Removed "Think about the best element to interact with."
+# which contradicted "Return ONLY JSON." — training targets are pure JSON
+# with no chain-of-thought.
 SYSTEM_PROMPT = """\
 You are a web automation agent.
 
@@ -70,7 +73,7 @@ class PromptBuilder:
     def __init__(
         self,
         system_prompt: str = SYSTEM_PROMPT,
-        max_candidates: int = 50,
+        max_candidates: int = 64,       # aligned with config (I3)
         max_history_entries: int = 10,
     ):
         self.system_prompt = system_prompt
@@ -100,65 +103,75 @@ class PromptBuilder:
         attributes: Optional[Dict[str, str]] = None,
         bbox: Optional[List[float]] = None,
     ) -> str:
+        """Format a single candidate for prompt display.
+
+        I4: When bbox is available, appends normalized @(x,y) coordinates
+        so the model can cross-reference candidate with screenshot.
         """
-        Format a single candidate element for the prompt.
+        display_tag = tag.upper()
 
-        Uses semantic uppercase tag names and includes position.
-        Example output:
-            [3] BUTTON "Search Flights" at (640,45 120x32) role=tab id=search-btn
-        """
-        # Semantic tag name
-        display_tag = PromptBuilder._TAG_DISPLAY.get(tag.lower(), tag.upper())
+        label = text
 
-        attrs = attributes or {}
-        # Keep only useful attributes
-        keep = {"role", "type", "placeholder", "aria-label", "href",
-                "name", "value", "title", "alt", "id", "for"}
-        attr_parts = []
-        for k, v in sorted(attrs.items()):
-            if k in keep and v:
-                attr_parts.append(f'{k}="{str(v)[:60]}"')
-        attr_str = " ".join(attr_parts)
-
-        text_str = f' "{text[:80]}"' if text else ""
-
-        # Position info from bounding box
-        pos_str = ""
-        if bbox and len(bbox) >= 4:
-            x, y, w, h = [int(v) for v in bbox[:4]]
-            if w > 0 and h > 0:
-                pos_str = f" at ({x},{y} {w}x{h})"
-
-        parts = [f"[{index}] {display_tag}{text_str}{pos_str}"]
-        if attr_str:
-            parts.append(attr_str)
-        return " ".join(parts)
-
-    @staticmethod
-    def format_candidate_list(candidates: List[Dict[str, Any]]) -> str:
-        """
-        Format a list of candidate elements for the prompt.
-
-        Each candidate dict should have:
-          - candidate_index: int
-          - tag: str
-          - text: str (optional)
-          - attributes: dict (optional)
-          - bbox: list (optional) — [x, y, w, h]
-        """
-        lines = []
-        for c in candidates:
-            line = PromptBuilder.format_candidate(
-                index=c["candidate_index"],
-                tag=c.get("tag", "div"),
-                text=c.get("text", ""),
-                attributes=c.get("attributes"),
-                bbox=c.get("bbox"),
+        if not label:
+            attrs = attributes or {}
+            label = (
+                attrs.get("placeholder")
+                or attrs.get("aria-label")
+                or attrs.get("name")
+                or ""
             )
-            lines.append(line)
-        return "\n".join(lines)
 
-    # ── Text prompt ───────────────────────────────────────────
+        # I4: Include normalized bounding box when available
+        if bbox and all(v is not None for v in bbox):
+            x, y, w, h = bbox
+            # Normalize to [0,1] relative to 1280×720 viewport
+            nx = round(x / 1280, 2)
+            ny = round(y / 720, 2)
+            if label:
+                return f'[{index}] {display_tag} "{label}" @({nx},{ny})'
+            else:
+                return f"[{index}] {display_tag} @({nx},{ny})"
+        else:
+            if label:
+                return f'[{index}] {display_tag} "{label}"'
+            else:
+                return f"[{index}] {display_tag}"
+
+    def format_candidate_list(self, candidates: List[Dict[str, Any]]) -> str:
+        """
+        Format a list of candidates for the prompt.
+
+        Parameters
+        ----------
+        candidates : list of dicts
+            Each dict must contain:
+              - "candidate_index" (int)
+              - "tag" (str)
+              - "text" (str, optional)
+              - "attributes" (dict, optional)
+              - "bbox" (list of floats, optional)
+
+        Returns
+        -------
+        str
+            Formatted list of candidates.
+        """
+        if not candidates:
+            return "No candidate elements available."
+
+        lines = []
+        for cand in candidates:
+            lines.append(
+                self.format_candidate(
+                    index=cand["candidate_index"],
+                    tag=cand["tag"],
+                    text=cand.get("text", ""),
+                    attributes=cand.get("attributes"),
+                    bbox=cand.get("bbox"),
+                )
+            )
+
+        return "\n".join(lines)
 
     def build_text_prompt(
         self,
@@ -166,6 +179,7 @@ class PromptBuilder:
         candidates: List[Dict[str, Any]],
         action_history: Optional[List[Dict[str, Any]]] = None,
         extra_context: str = "",
+        dom_context: str = "",
     ) -> str:
         """
         Build the text portion of the multimodal prompt.
@@ -180,6 +194,8 @@ class PromptBuilder:
             Previous actions taken.
         extra_context : str, optional
             Additional context (e.g., current URL, page title).
+        dom_context : str, optional
+            Filtered serialized DOM context (I1: interactable nodes only).
         """
         parts = []
 
@@ -189,6 +205,10 @@ class PromptBuilder:
         # Extra context
         if extra_context:
             parts.append(f"[CONTEXT]\n{extra_context}\n")
+
+        # I1: DOM structural context (interactable nodes only)
+        if dom_context:
+            parts.append(f"[PAGE STRUCTURE]\n{dom_context[:2000]}\n")
 
         # Action history
         if action_history:
@@ -202,12 +222,9 @@ class PromptBuilder:
         candidates_text = self.format_candidate_list(truncated)
         parts.append(f"[CANDIDATE ELEMENTS]\n{candidates_text}\n")
 
-        # Instruction
-        parts.append(
-            "Think about the best element to interact with.\n"
-            "Then output the action in JSON.\n\n"
-            "ACTION:"
-        )
+        # FIX S5: Removed "Think about the best element" instruction
+        # which contradicted "Return ONLY JSON" in the system prompt.
+        parts.append("Output exactly ONE JSON action:")
 
         return "\n".join(parts)
 
@@ -220,6 +237,7 @@ class PromptBuilder:
         action_history: Optional[List[Dict[str, Any]]] = None,
         screenshot_placeholder: bool = True,
         extra_context: str = "",
+        dom_context: str = "",
     ) -> List[Dict[str, Any]]:
         """
         Build chat-format messages for Qwen2-VL.
@@ -241,6 +259,7 @@ class PromptBuilder:
             candidates=candidates,
             action_history=action_history,
             extra_context=extra_context,
+            dom_context=dom_context,
         )
         user_content.append({
             "type": "text",
@@ -263,6 +282,7 @@ class PromptBuilder:
         target_action: Dict[str, Any],
         action_history: Optional[List[Dict[str, Any]]] = None,
         extra_context: str = "",
+        dom_context: str = "",
     ) -> Dict[str, str]:
         """
         Build a training example with prompt + target.
@@ -277,6 +297,7 @@ class PromptBuilder:
             candidates=candidates,
             action_history=action_history,
             extra_context=extra_context,
+            dom_context=dom_context,
         )
         target = json.dumps(target_action, ensure_ascii=False)
 
@@ -294,6 +315,7 @@ class PromptBuilder:
         screenshot: Optional[Any] = None,
         action_history: Optional[List[Dict[str, Any]]] = None,
         extra_context: str = "",
+        dom_context: str = "",
     ) -> Dict[str, Any]:
         """
         Build Qwen2-VL chat messages for multimodal training.
@@ -308,6 +330,7 @@ class PromptBuilder:
             candidates=candidates,
             action_history=action_history,
             extra_context=extra_context,
+            dom_context=dom_context,
         )
         target_text = json.dumps(target_action, ensure_ascii=False)
 

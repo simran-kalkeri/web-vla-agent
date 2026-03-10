@@ -96,7 +96,7 @@ class TokenUncertainty:
         Assess uncertainty from beam search results.
 
         Checks:
-          1. Agreement: do all beams produce the same action type + element_id?
+          1. Agreement: do all beams produce the same action type + candidate?
           2. Score spread: how different are the beam scores?
 
         Parameters
@@ -119,7 +119,7 @@ class TokenUncertainty:
             except (json.JSONDecodeError, ValueError):
                 parsed_actions.append(None)
 
-        # Check agreement on action type and element_id
+        # Check agreement on action type and candidate (S2 FIX)
         valid_actions = [a for a in parsed_actions if a is not None]
         if not valid_actions:
             return UncertaintyResult(
@@ -128,10 +128,11 @@ class TokenUncertainty:
                 reason="No valid actions from any beam",
             )
 
-        # Agreement metric: what fraction agree on action + element_id?
+        # Agreement metric: what fraction agree on action + candidate?
+        # FIX S2: use 'candidate' key instead of 'element_id' (which is never populated)
         signatures = []
         for a in valid_actions:
-            sig = f"{a.get('action', '?')}_{a.get('element_id', '?')}"
+            sig = f"{a.get('action', '?')}_{a.get('candidate', a.get('element_id', '?'))}"
             signatures.append(sig)
 
         most_common = max(set(signatures), key=signatures.count)
@@ -143,7 +144,7 @@ class TokenUncertainty:
         for i, (beam, action) in enumerate(zip(beam_results, parsed_actions)):
             if action is None:
                 continue
-            sig = f"{action.get('action', '?')}_{action.get('element_id', '?')}"
+            sig = f"{action.get('action', '?')}_{action.get('candidate', action.get('element_id', '?'))}"
             if sig == most_common and beam.get("score", 0) > best_score:
                 best_action = action
                 best_score = beam["score"]

@@ -15,9 +15,11 @@ among negatives to prevent the model from learning position bias.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,6 +67,9 @@ class Mind2WebSample:
     step_index: int = 0
     trajectory_id: str = ""
 
+    # C4 FIX: Ground-truth element identity for evaluation
+    gt_backend_node_id: int = -1
+
 
 @dataclass
 class Mind2WebTrajectory:
@@ -101,9 +106,9 @@ class Mind2WebLoader:
         dataset_name: str = "osunlp/Multimodal-Mind2Web",
         max_dom_nodes: int = 500,
         max_text_per_node: int = 200,
-        max_neg_candidates: int = 30,
+        max_neg_candidates: int = 63,       # C3/I3: 63 neg + 1 pos = 64
         scroll_augmentation: bool = True,
-        scroll_aug_ratio: float = 0.2,
+        scroll_aug_ratio: float = 0.05,
     ):
         self.dataset_name = dataset_name
         self.max_dom_nodes = max_dom_nodes
@@ -174,6 +179,9 @@ class Mind2WebLoader:
         domain = raw_sample.get("domain", "")
         subdomain = raw_sample.get("subdomain", "")
 
+        # C2: Capture step_index from raw data
+        step_index = raw_sample.get("target_action_index", 0)
+
         # Get HTML
         cleaned_html = raw_sample.get("cleaned_html", "")
         raw_html = raw_sample.get("raw_html", "")
@@ -187,7 +195,7 @@ class Mind2WebLoader:
                 logger.warning(f"DOM serialization failed for {sample_id}: {e}")
                 serialized_dom = ""
 
-        # Extract screenshot
+        # Extract screenshot (S4 FIX: returns None if no screenshot)
         screenshot = None
         if include_screenshot:
             screenshot = self._extract_screenshot(raw_sample)
@@ -205,7 +213,7 @@ class Mind2WebLoader:
         value = operation.get("value", "")
 
         # ── Extract candidates ───────────────────────────────
-        candidates, target_idx = self._build_candidates(raw_sample, cleaned_html)
+        candidates, target_idx, gt_backend_node_id = self._build_candidates(raw_sample, cleaned_html)
 
         if not candidates or target_idx < 0:
             # Fallback: try to build from full DOM
@@ -224,6 +232,8 @@ class Mind2WebLoader:
                 action={},
                 action_repr=self._get_action_repr(raw_sample),
                 trajectory_id=sample_id,
+                step_index=step_index,
+                gt_backend_node_id=-1,
             )
 
         # Build action with candidate index
@@ -250,6 +260,8 @@ class Mind2WebLoader:
             action=action,
             action_repr=action_repr,
             trajectory_id=sample_id,
+            step_index=step_index,
+            gt_backend_node_id=gt_backend_node_id,
         )
 
     _LOGGED_FIRST_CANDIDATE = False
@@ -258,7 +270,7 @@ class Mind2WebLoader:
         self,
         raw_sample: Dict[str, Any],
         cleaned_html: str,
-    ) -> Tuple[List[Dict[str, Any]], int]:
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
         """
         Build the candidate list from pos_candidates and neg_candidates.
 
@@ -271,9 +283,11 @@ class Mind2WebLoader:
         Returns
         -------
         candidates : list of candidate dicts
-            Each has: candidate_index, tag, text, attributes, backend_node_id
+            Each has: candidate_index, tag, text, attributes, backend_node_id, bbox
         target_idx : int
             The candidate_index of the positive candidate (target element)
+        gt_backend_node_id : int
+            The backend_node_id of the positive (ground-truth) element (C4 FIX)
         """
         pos_candidates = raw_sample.get("pos_candidates", [])
         neg_candidates = raw_sample.get("neg_candidates", [])
@@ -308,7 +322,7 @@ class Mind2WebLoader:
             logger.info("═════════════════════════════════════")
 
         if not pos_candidates:
-            return [], -1
+            return [], -1, -1
 
         # Extract the first positive candidate
         pos_cand = pos_candidates[0]
@@ -318,7 +332,10 @@ class Mind2WebLoader:
                 f"Failed to parse pos_candidate: type={type(pos_cand).__name__}, "
                 f"preview={str(pos_cand)[:200]}"
             )
-            return [], -1
+            return [], -1, -1
+
+        # C4 FIX: capture ground-truth backend_node_id
+        gt_backend_node_id = pos_element.get("backend_node_id", -1)
 
         # Extract negative candidates (limit count)
         neg_elements = []
@@ -350,7 +367,7 @@ class Mind2WebLoader:
         for c in candidates:
             c.pop("_is_positive", None)
 
-        return candidates, target_idx
+        return candidates, target_idx, gt_backend_node_id
 
     def _candidate_to_element(
         self,
@@ -433,11 +450,24 @@ class Mind2WebLoader:
                 except (ValueError, TypeError):
                     backend_node_id = -1
 
+            # I4: Extract bounding_box_rect for spatial grounding
+            bbox = None
+            if isinstance(attributes, dict):
+                bbox_str = attributes.get("bounding_box_rect", "")
+                if bbox_str:
+                    try:
+                        parts = [float(x) for x in str(bbox_str).split(",")[:4]]
+                        if len(parts) == 4:
+                            bbox = parts  # [x, y, w, h]
+                    except (ValueError, TypeError):
+                        pass
+
             return {
                 "tag": tag,
                 "text": str(text)[:200],
                 "attributes": attributes if isinstance(attributes, dict) else {},
                 "backend_node_id": backend_node_id,
+                "bbox": bbox,
                 "_is_positive": is_positive,
             }
 
@@ -462,6 +492,7 @@ class Mind2WebLoader:
             "text": "",
             "attributes": {},
             "backend_node_id": nid,
+            "bbox": None,
             "_is_positive": is_positive,
         }
 
@@ -477,7 +508,7 @@ class Mind2WebLoader:
         self,
         cleaned_html: str,
         pos_element: Dict[str, Any],
-        max_count: int = 30,
+        max_count: int = 63,
     ) -> List[Dict[str, Any]]:
         """
         Extract negative candidates from the full DOM when dataset
@@ -506,6 +537,7 @@ class Mind2WebLoader:
                 "text": node.text[:200],
                 "attributes": dict(node.attributes),
                 "backend_node_id": node.node_id,
+                "bbox": None,
                 "_is_positive": False,
             })
 
@@ -611,6 +643,7 @@ class Mind2WebLoader:
             action_history=sample.action_history,
             step_index=sample.step_index,
             trajectory_id=sample.trajectory_id,
+            gt_backend_node_id=-1,
         )
 
     def build_trajectories(
@@ -622,35 +655,79 @@ class Mind2WebLoader:
         """
         Group samples into trajectories for multi-step training.
 
-        Samples with the same annotation_id prefix are grouped together.
-        Each step gets the action history from previous steps.
+        C2 FIX: The correct grouping key is a hash of
+        (confirmed_task + website + action_reprs). The field action_reprs
+        is a list of ALL action strings for the whole task.
+        Samples with the same (task, website, action_reprs) belong to
+        the same trajectory.
+
+        Pass 1: Group raw samples by trajectory key.
+        Pass 2: Process each group, sort by target_action_index,
+                 inject cumulative action_history.
         """
-        samples = self.build_training_examples(
-            split=split,
-            max_samples=max_samples,
-            include_screenshot=include_screenshot,
-        )
+        ds = self.load_dataset(split=split, max_samples=max_samples)
 
-        # Group by trajectory_id (annotation_id)
-        traj_map: Dict[str, List[Mind2WebSample]] = {}
-        for s in samples:
-            tid = s.trajectory_id
-            if tid not in traj_map:
-                traj_map[tid] = []
-            traj_map[tid].append(s)
+        # ── Pass 1: Group raw samples by trajectory key ──────────
+        traj_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+        for i, raw in enumerate(ds):
+            try:
+                confirmed_task = raw.get("confirmed_task", "")
+                website = raw.get("website", "")
+                action_reprs = raw.get("action_reprs", [])
+                if isinstance(action_reprs, str):
+                    try:
+                        action_reprs = json.loads(action_reprs)
+                    except json.JSONDecodeError:
+                        action_reprs = [action_reprs]
+                if not isinstance(action_reprs, list):
+                    action_reprs = [str(action_reprs)]
+
+                # Build trajectory key from task + website + all action representations
+                repr_str = "||".join(str(r) for r in action_reprs)
+                traj_key_raw = f"{confirmed_task}|||{website}|||{repr_str}"
+                traj_key = hashlib.md5(traj_key_raw.encode()).hexdigest()
+
+                traj_groups[traj_key].append(raw)
+            except Exception as e:
+                logger.warning(f"Failed to group sample {i}: {e}")
+                continue
+
+        logger.info(f"Pass 1: {len(traj_groups)} trajectory groups from {split}")
+
+        # ── Pass 2: Process each group ───────────────────────────
         trajectories = []
-        for tid, steps in traj_map.items():
-            # Sort by step index
-            steps.sort(key=lambda s: s.step_index)
+        total_steps = 0
+        skipped_single_step = 0
 
-            # Build action history for each step
+        for traj_key, raw_steps in traj_groups.items():
+            # Sort by target_action_index
+            raw_steps.sort(key=lambda r: r.get("target_action_index", 0))
+
+            # Process each step
+            processed_steps: List[Mind2WebSample] = []
+            for raw in raw_steps:
+                try:
+                    sample = self.process_sample(raw, include_screenshot=include_screenshot)
+                    if sample.candidates and sample.target_candidate_index >= 0 and sample.action:
+                        sample.trajectory_id = traj_key
+                        sample.step_index = raw.get("target_action_index", 0)
+                        processed_steps.append(sample)
+                except Exception as e:
+                    logger.debug(f"Failed to process step in trajectory {traj_key}: {e}")
+                    continue
+
+            # Skip trajectories with fewer than 2 valid steps
+            if len(processed_steps) < 2:
+                skipped_single_step += 1
+                continue
+
+            # Inject cumulative action_history
             history: List[Dict[str, Any]] = []
-            for i, step in enumerate(steps):
-                step.step_index = i
-                step.action_history = list(history)
+            for step in processed_steps:
+                step.action_history = list(history)  # copy of ALL prior steps' actions
                 history.append({
-                    "step": i,
+                    "step": step.step_index,
                     "action": step.action.get("action", ""),
                     "candidate": step.action.get("candidate", -1),
                     "value": step.action.get("value", ""),
@@ -658,14 +735,20 @@ class Mind2WebLoader:
                 })
 
             trajectories.append(Mind2WebTrajectory(
-                trajectory_id=tid,
-                task=steps[0].task if steps else "",
-                website=steps[0].website if steps else "",
-                domain=steps[0].domain if steps else "",
-                steps=steps,
+                trajectory_id=traj_key,
+                task=processed_steps[0].task if processed_steps else "",
+                website=processed_steps[0].website if processed_steps else "",
+                domain=processed_steps[0].domain if processed_steps else "",
+                steps=processed_steps,
             ))
+            total_steps += len(processed_steps)
 
-        logger.info(f"Built {len(trajectories)} trajectories with {sum(len(t.steps) for t in trajectories)} total steps")
+        avg_steps = total_steps / max(len(trajectories), 1)
+        logger.info(
+            f"Built {len(trajectories)} trajectories with {total_steps} total steps "
+            f"(avg {avg_steps:.1f} steps/traj, skipped {skipped_single_step} single-step)"
+        )
+
         return trajectories
 
     def _get_action_repr(self, raw_sample: Dict[str, Any]) -> str:
@@ -687,9 +770,9 @@ class Mind2WebLoader:
         """
         Extract screenshot from the dataset sample.
 
-        Always returns an RGB PIL Image. If the sample has no screenshot,
-        returns a white placeholder (224x224) so every training sample
-        is multimodal and the vision pipeline stays active.
+        S4 FIX: Returns None if no screenshot is available, instead of a
+        white placeholder image. A 224×224 white image creates spurious
+        visual tokens that the model learns to associate with valid states.
         """
         screenshot = raw_sample.get("screenshot")
         img = None
@@ -713,9 +796,9 @@ class Mind2WebLoader:
             except Exception:
                 img = None
 
-        # Fallback: white placeholder so every sample is multimodal
+        # S4 FIX: Return None instead of white placeholder
         if img is None:
-            img = Image.new("RGB", (224, 224), (255, 255, 255))
+            return None
 
         # Ensure RGB (Qwen2-VL image processor requires 3-channel input)
         if img.mode != "RGB":

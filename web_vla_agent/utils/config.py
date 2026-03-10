@@ -35,13 +35,13 @@ class ModelConfig:
     )
     # Image resolution limits for Qwen2-VL processor
     image_min_pixels: int = 43904      # 56 * 28 * 28 — ~150 vision tokens min
-    image_max_pixels: int = 401408     # 512 * 28 * 28 — ~450 vision tokens max
+    image_max_pixels: int = 802816     # 1024 * 28 * 28 — ~800 vision tokens max (I6)
 
 
 @dataclass
 class TrainingConfig:
     stage1_epochs: int = 5
-    stage2_epochs: int = 10
+    stage2_epochs: int = 5           # aligned: was 10 in dataclass, 3 in yaml → 5
     stage3_epochs: int = 0
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
@@ -65,7 +65,9 @@ class DataConfig:
     max_action_history: int = 10
     max_text_per_node: int = 200
     scroll_augmentation: bool = True
-    scroll_aug_ratio: float = 0.2
+    scroll_aug_ratio: float = 0.05   # aligned with config.yaml (was 0.2)
+    max_neg_candidates: int = 63     # 63 neg + 1 pos = 64 total (I3)
+    max_candidates: int = 64         # standardized candidate count (I3)
 
 
 @dataclass

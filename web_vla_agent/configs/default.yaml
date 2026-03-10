@@ -18,9 +18,9 @@ model:
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
   quantization_bits: 4
 
-  # Image resolution limits for Qwen2-VL processor (conservative for 48GB GPU)
+  # Image resolution limits for Qwen2-VL processor (I6: increased for better text readability)
   image_min_pixels: 43904      # 56 * 28 * 28 — ~150 vision tokens min
-  image_max_pixels: 401408     # 512 * 28 * 28 — ~450 vision tokens max
+  image_max_pixels: 802816     # 1024 * 28 * 28 — ~800 vision tokens max
 
   # Action types
   action_types: ["CLICK", "TYPE", "SELECT", "SCROLL", "DONE"]
@@ -28,8 +28,8 @@ model:
 training:
   # Stage 1: Single-step imitation
   stage1_epochs: 5
-  # Stage 2: Multi-step imitation
-  stage2_epochs: 3
+  # Stage 2: Multi-step imitation (aligned to 5)
+  stage2_epochs: 5
   # Stage 3 (optional): RL fine-tuning
   stage3_epochs: 0
 
@@ -60,6 +60,8 @@ data:
   max_text_per_node: 80
   scroll_augmentation: true
   scroll_aug_ratio: 0.05
+  max_neg_candidates: 63    # 63 neg + 1 pos = 64 total
+  max_candidates: 64        # standardized candidate count
 
 environment:
   headless: true

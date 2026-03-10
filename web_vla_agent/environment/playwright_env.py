@@ -7,6 +7,9 @@ Provides a gym-like interface for the VLA agent with:
   - Interactable element detection
   - CLICK, TYPE, SELECT, SCROLL action execution
   - Step loop with max-step cap, timeout, exception handling
+
+S7 FIX: Element lookup by stable attributes (data-backend-node-id, id)
+instead of sequential counter traversal which is fragile to DOM mutations.
 """
 from __future__ import annotations
 
@@ -90,6 +93,8 @@ class WebAction:
 
 
 # ── JS for element extraction ────────────────────────────────
+# S7 FIX: Assigns stable IDs using data-backend-node-id or id attribute first,
+# falls back to sequential counter only if neither attribute exists.
 
 _EXTRACT_ELEMENTS_JS = """
 () => {
@@ -100,7 +105,7 @@ _EXTRACT_ELEMENTS_JS = """
         null,
         false
     );
-    let nodeId = 0;
+    let seqId = 0;
     const interactableTags = new Set([
         'a', 'button', 'input', 'select', 'textarea', 'option',
         'label', 'summary', 'details', 'area'
@@ -115,7 +120,7 @@ _EXTRACT_ELEMENTS_JS = """
     ]);
 
     let node = walker.currentNode;
-    while (node && nodeId < 600) {
+    while (node && seqId < 600) {
         const tag = node.tagName ? node.tagName.toLowerCase() : '';
         if (tag && !skipTags.has(tag)) {
             const rect = node.getBoundingClientRect();
@@ -149,7 +154,8 @@ _EXTRACT_ELEMENTS_JS = """
                 const attrs = {};
                 for (const attr of ['id', 'class', 'role', 'type', 'placeholder',
                     'aria-label', 'href', 'name', 'value', 'title', 'alt',
-                    'for', 'action', 'src']) {
+                    'for', 'action', 'src', 'data-backend-node-id',
+                    'contenteditable']) {
                     const val = node.getAttribute(attr);
                     if (val) attrs[attr] = val.substring(0, 100);
                 }
@@ -158,6 +164,23 @@ _EXTRACT_ELEMENTS_JS = """
                 let depth = 0;
                 let parent = node.parentElement;
                 while (parent) { depth++; parent = parent.parentElement; }
+
+                // S7 FIX: Stable node ID assignment
+                // Try data-backend-node-id first, then id attribute, then sequential
+                let nodeId = seqId;  // fallback
+                const backendId = node.getAttribute('data-backend-node-id');
+                if (backendId) {
+                    nodeId = parseInt(backendId, 10);
+                    if (isNaN(nodeId)) nodeId = seqId;
+                }
+
+                // Store the stable_id attribute for action execution
+                let stableSelector = '';
+                if (backendId) {
+                    stableSelector = `[data-backend-node-id="${backendId}"]`;
+                } else if (node.id) {
+                    stableSelector = `#${CSS.escape(node.id)}`;
+                }
 
                 results.push({
                     node_id: nodeId,
@@ -172,11 +195,12 @@ _EXTRACT_ELEMENTS_JS = """
                     ],
                     depth: depth,
                     is_interactable: isInteractable,
-                    is_visible: true
+                    is_visible: true,
+                    stable_selector: stableSelector
                 });
             }
         }
-        nodeId++;
+        seqId++;
         node = walker.nextNode();
     }
     return results;
@@ -435,11 +459,21 @@ class BrowserEnvironment:
             raise ValueError(f"Unknown action type: {action.action}")
 
     async def _do_click(self, element_id: int) -> None:
-        """Click on element by node_id."""
+        """Click on element by node_id.
+
+        S7 FIX: Try stable attribute selectors first, fall back to sequential traversal.
+        """
         assert self._page is not None
-        # Use JS to find and click element by our assigned node_id
+        # S7 FIX: Try data-backend-node-id first, then id, then sequential fallback
         js = f"""
         () => {{
+            // Try by data-backend-node-id first
+            let el = document.querySelector('[data-backend-node-id="{element_id}"]');
+            if (el) {{
+                el.click();
+                return true;
+            }}
+            // Fall back to sequential traversal
             const walker = document.createTreeWalker(
                 document.body, NodeFilter.SHOW_ELEMENT, null, false
             );
@@ -461,26 +495,38 @@ class BrowserEnvironment:
             raise ValueError(f"Element with id={element_id} not found")
 
     async def _do_type(self, element_id: int, value: str) -> None:
-        """Type text into element by node_id."""
+        """Type text into element by node_id.
+
+        S7 FIX: Try stable attribute selectors first, fall back to sequential traversal.
+        """
         assert self._page is not None
         escaped_value = value.replace("'", "\\'").replace('"', '\\"')
         js = f"""
         () => {{
-            const walker = document.createTreeWalker(
-                document.body, NodeFilter.SHOW_ELEMENT, null, false
-            );
-            let nodeId = 0;
-            let node = walker.currentNode;
-            while (node && nodeId <= {element_id}) {{
-                if (nodeId === {element_id}) {{
-                    node.focus();
-                    node.value = "{escaped_value}";
-                    node.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    node.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return true;
+            // Try by data-backend-node-id first
+            let el = document.querySelector('[data-backend-node-id="{element_id}"]');
+            if (!el) {{
+                // Fall back to sequential traversal
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_ELEMENT, null, false
+                );
+                let nodeId = 0;
+                let node = walker.currentNode;
+                while (node && nodeId <= {element_id}) {{
+                    if (nodeId === {element_id}) {{
+                        el = node;
+                        break;
+                    }}
+                    nodeId++;
+                    node = walker.nextNode();
                 }}
-                nodeId++;
-                node = walker.nextNode();
+            }}
+            if (el) {{
+                el.focus();
+                el.value = "{escaped_value}";
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
             }}
             return false;
         }}
@@ -490,29 +536,41 @@ class BrowserEnvironment:
             raise ValueError(f"Element with id={element_id} not found for typing")
 
     async def _do_select(self, element_id: int, value: str) -> None:
-        """Select option in element by node_id."""
+        """Select option in element by node_id.
+
+        S7 FIX: Try stable attribute selectors first, fall back to sequential traversal.
+        """
         assert self._page is not None
         escaped_value = value.replace("'", "\\'").replace('"', '\\"')
         js = f"""
         () => {{
-            const walker = document.createTreeWalker(
-                document.body, NodeFilter.SHOW_ELEMENT, null, false
-            );
-            let nodeId = 0;
-            let node = walker.currentNode;
-            while (node && nodeId <= {element_id}) {{
-                if (nodeId === {element_id}) {{
-                    for (const opt of node.options || []) {{
-                        if (opt.text === "{escaped_value}" || opt.value === "{escaped_value}") {{
-                            opt.selected = true;
-                            node.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return true;
-                        }}
+            // Try by data-backend-node-id first
+            let el = document.querySelector('[data-backend-node-id="{element_id}"]');
+            if (!el) {{
+                // Fall back to sequential traversal
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_ELEMENT, null, false
+                );
+                let nodeId = 0;
+                let node = walker.currentNode;
+                while (node && nodeId <= {element_id}) {{
+                    if (nodeId === {element_id}) {{
+                        el = node;
+                        break;
                     }}
-                    return false;
+                    nodeId++;
+                    node = walker.nextNode();
                 }}
-                nodeId++;
-                node = walker.nextNode();
+            }}
+            if (el) {{
+                for (const opt of el.options || []) {{
+                    if (opt.text === "{escaped_value}" || opt.value === "{escaped_value}") {{
+                        opt.selected = true;
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return true;
+                    }}
+                }}
+                return false;
             }}
             return false;
         }}

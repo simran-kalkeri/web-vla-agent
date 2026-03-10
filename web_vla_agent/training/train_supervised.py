@@ -21,6 +21,9 @@ Data flow:
 CRITICAL: The Qwen2-VL processor MUST be called ONCE for the entire batch.
 Per-sample processor calls corrupt the internal pixel_values ↔ image_grid_thw
 mapping and produce garbage grid values that overflow the vision encoder.
+
+S1 FIX: Added cosine LR scheduler with linear warmup.
+I6 FIX: Image resolution limits configurable via config.
 """
 from __future__ import annotations
 
@@ -70,6 +73,24 @@ class Mind2WebVLADataset(Dataset):
         return self.samples[idx]
 
 
+class TrajectoryDataset(Dataset):
+    """
+    PyTorch Dataset for trajectory-based multi-step training (C2 FIX).
+
+    Each item is a single trajectory (Mind2WebTrajectory), yielding
+    all steps in order. The collate function handles interleaving.
+    """
+
+    def __init__(self, trajectories: list):
+        self.trajectories = trajectories
+
+    def __len__(self):
+        return len(self.trajectories)
+
+    def __getitem__(self, idx):
+        return self.trajectories[idx]
+
+
 # ── Multimodal collate function ──────────────────────────────
 
 _PRINTED_SAMPLE = False
@@ -84,8 +105,10 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     3. Call processor() ONCE on the full batch
     4. Find assistant content boundary via token search for label masking
 
-    The processor handles pixel_values batching, image_grid_thw construction,
-    image token expansion, and padding internally.
+    S4 FIX: Handles samples with screenshot=None by skipping them
+    from the images list. The processor handles text-only samples fine.
+
+    I6: Added check for excessive vision tokens from high-res images.
 
     Returns dict with:
       - input_ids: [batch, seq_len]
@@ -141,7 +164,7 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
         )
         all_full_texts.append(full_text)
 
-        # Collect screenshot image (every sample has one — fallback is a white img)
+        # S4 FIX: Only add screenshot if it's not None
         if sample.screenshot is not None:
             all_images.append(sample.screenshot)
 
@@ -156,24 +179,23 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     )
 
     # ── Ensure batch dimension exists for image_grid_thw ──
-    # Qwen2-VL processor pixel_values shape is ALWAYS [total_patches, hidden_dim]
-    # (no batch dimension) — this is correct, do NOT unsqueeze it.
-    # Only image_grid_thw may collapse from [1,3] → [3] when batch_size=1.
     if "image_grid_thw" in batch_inputs:
         if batch_inputs["image_grid_thw"].dim() == 1:
             batch_inputs["image_grid_thw"] = batch_inputs["image_grid_thw"].unsqueeze(0)
 
+    # I6: Check for excessive vision tokens
+    if "image_grid_thw" in batch_inputs:
+        total_vision_tokens = batch_inputs["image_grid_thw"].prod(dim=-1).sum().item()
+        if total_vision_tokens > 5000:
+            logger.warning(
+                f"High vision token count: {total_vision_tokens}. "
+                f"Consider lowering image_max_pixels in config."
+            )
+
     # ── Build labels with prompt masking ──
-    # Strategy: find the last <|im_start|> token in each sequence
-    # (marks the assistant turn), then mask everything before
-    # the assistant's content with -100.
     labels = batch_inputs["input_ids"].clone()
 
-    # Get the token ID for <|im_start|>
     im_start_id = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
-
-    # Tokenize the assistant role header to measure its length
-    # Chat template format: <|im_start|>assistant\n{content}<|im_end|>\n
     assistant_header_ids = processor.tokenizer.encode(
         "<|im_start|>assistant\n", add_special_tokens=False
     )
@@ -181,26 +203,17 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
 
     for i in range(labels.shape[0]):
         ids = batch_inputs["input_ids"][i]
-
-        # Find all <|im_start|> positions
         positions = (ids == im_start_id).nonzero(as_tuple=True)[0]
 
         if len(positions) >= 3:
-            # Last <|im_start|> = assistant turn start
             assistant_start = positions[-1].item()
-
-            # Content begins after the header: <|im_start|>assistant\n
             content_start = assistant_start + header_len
-
-            # Mask everything before assistant content (= prompt)
             labels[i, :content_start] = -100
         elif len(positions) >= 1:
-            # Fallback: use last <|im_start|> + header
             assistant_start = positions[-1].item()
             content_start = assistant_start + header_len
             labels[i, :content_start] = -100
         else:
-            # No <|im_start|> found — mask everything (shouldn't happen)
             print(f"WARNING: No <|im_start|> found in sample {i}, masking all tokens")
             labels[i, :] = -100
 
@@ -220,7 +233,7 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     if "image_grid_thw" in batch_inputs:
         result["image_grid_thw"] = batch_inputs["image_grid_thw"]
 
-    # First-batch diagnostics (print to stdout — logger may not be configured)
+    # First-batch diagnostics
     global _COLLATE_LOGGED_FIRST
     if not _COLLATE_LOGGED_FIRST:
         _COLLATE_LOGGED_FIRST = True
@@ -239,7 +252,6 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
             print(f"  image_grid_thw values:\n{result['image_grid_thw']}")
         else:
             print("  image_grid_thw: MISSING")
-        # Label stats
         num_target = (result["labels"] != -100).sum().item()
         total = result["labels"].numel()
         print(f"  Supervised tokens: {num_target}/{total} ({100*num_target/total:.1f}%)")
@@ -251,11 +263,82 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
 _COLLATE_LOGGED_FIRST = False
 
 
+def trajectory_collate_fn(batch, processor, prompt_builder, max_seq_length=2048):
+    """
+    Collate trajectories into interleaved step-level batches (C2 FIX).
+
+    Each item in batch is a Mind2WebTrajectory. This function extracts
+    all steps across trajectories, then delegates to multimodal_collate_fn.
+    """
+    all_steps = []
+    for traj in batch:
+        all_steps.extend(traj.steps)
+
+    # Delegate to the standard multimodal collate
+    return multimodal_collate_fn(
+        all_steps,
+        processor=processor,
+        prompt_builder=prompt_builder,
+        max_seq_length=max_seq_length,
+    )
+
+
+def validate_trajectories(trajectories: list) -> Dict[str, Any]:
+    """
+    Pre-training diagnostic for trajectory data quality.
+
+    Reports statistics about trajectory lengths, action distributions,
+    and data integrity issues.
+    """
+    if not trajectories:
+        return {"error": "No trajectories provided"}
+
+    step_counts = [len(t.steps) for t in trajectories]
+    action_counts = {}
+    samples_with_history = 0
+    samples_with_screenshot = 0
+    total_steps = sum(step_counts)
+
+    for traj in trajectories:
+        for step in traj.steps:
+            action_type = step.action.get("action", "UNKNOWN")
+            action_counts[action_type] = action_counts.get(action_type, 0) + 1
+            if step.action_history:
+                samples_with_history += 1
+            if step.screenshot is not None:
+                samples_with_screenshot += 1
+
+    stats = {
+        "num_trajectories": len(trajectories),
+        "total_steps": total_steps,
+        "avg_steps_per_trajectory": total_steps / len(trajectories),
+        "min_steps": min(step_counts),
+        "max_steps": max(step_counts),
+        "action_distribution": action_counts,
+        "pct_with_history": samples_with_history / max(total_steps, 1),
+        "pct_with_screenshot": samples_with_screenshot / max(total_steps, 1),
+    }
+
+    print("\n========== TRAJECTORY DIAGNOSTICS ==========")
+    print(f"  Trajectories: {stats['num_trajectories']}")
+    print(f"  Total steps: {stats['total_steps']}")
+    print(f"  Avg steps/traj: {stats['avg_steps_per_trajectory']:.1f}")
+    print(f"  Step range: [{stats['min_steps']}, {stats['max_steps']}]")
+    print(f"  With history: {stats['pct_with_history']:.1%}")
+    print(f"  With screenshot: {stats['pct_with_screenshot']:.1%}")
+    print(f"  Action distribution: {stats['action_distribution']}")
+    print("============================================\n")
+
+    return stats
+
+
 # ── Trainer ──────────────────────────────────────────────────
 
 class VLATrainer:
     """
     Multi-stage imitation learning trainer for VLA Web Agent.
+
+    S1 FIX: Includes cosine LR scheduler with linear warmup.
 
     Parameters
     ----------
@@ -272,7 +355,7 @@ class VLATrainer:
         self.device = device
         self.model = None
         self.optimizer = None
-        self.scheduler = None
+        self.scheduler = None       # S1: LR scheduler
 
     def setup(self, skip_lora: bool = False) -> None:
         """Initialize model, optimizer, and scheduler.
@@ -296,7 +379,7 @@ class VLATrainer:
         else:
             logger.info("Skipping apply_lora() — checkpoint will provide LoRA weights")
 
-        # Configure processor image resolution limits
+        # I6: Configure processor image resolution limits
         if hasattr(self.model.processor, "image_processor"):
             self.model.processor.image_processor.min_pixels = (
                 self.config.model.image_min_pixels
@@ -317,7 +400,34 @@ class VLATrainer:
             weight_decay=self.config.training.weight_decay,
         )
 
+        # S1 FIX: Scheduler is created per-stage in _setup_scheduler()
+        # because it needs total_steps which depends on the dataloader.
+        self.scheduler = None
+
         logger.info("Training setup complete")
+
+    def _setup_scheduler(self, num_training_steps: int) -> None:
+        """
+        S1 FIX: Create cosine LR scheduler with linear warmup.
+
+        Uses transformers.get_cosine_schedule_with_warmup for smooth
+        learning rate annealing that prevents catastrophic forgetting
+        at the end of training.
+        """
+        from transformers import get_cosine_schedule_with_warmup
+
+        num_warmup_steps = int(num_training_steps * self.config.training.warmup_ratio)
+
+        self.scheduler = get_cosine_schedule_with_warmup(
+            optimizer=self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        logger.info(
+            f"LR Scheduler: cosine with {num_warmup_steps} warmup steps "
+            f"out of {num_training_steps} total"
+        )
 
     def _run_training_loop(
         self,
@@ -330,6 +440,8 @@ class VLATrainer:
         """
         Shared training loop for Stage 1 and Stage 2.
 
+        S1 FIX: Calls scheduler.step() after each optimizer step.
+
         Returns dict with metrics history.
         """
         self.model.model.train()
@@ -338,12 +450,21 @@ class VLATrainer:
         metrics_history = []
         num_batches = len(dataloader)
 
+        # S1 FIX: Setup scheduler with correct total steps
+        total_training_steps = (num_batches // grad_accum) * num_epochs
+        if total_training_steps > 0:
+            self._setup_scheduler(total_training_steps)
+
+        current_lr = self.config.training.learning_rate
+
         print(f"\n{'='*60}")
         print(f"  Stage {stage} Training")
         print(f"  Epochs: {num_epochs} | Batches/epoch: {num_batches}")
         print(f"  Batch size: {self.config.training.batch_size} | Grad accum: {grad_accum}")
         print(f"  Effective batch size: {self.config.training.batch_size * grad_accum}")
         print(f"  LR: {self.config.training.learning_rate}")
+        if self.scheduler:
+            print(f"  Scheduler: cosine warmup ({int(total_training_steps * self.config.training.warmup_ratio)} warmup)")
         print(f"{'='*60}\n")
 
         for epoch in range(num_epochs):
@@ -367,8 +488,6 @@ class VLATrainer:
                     )
 
                     # ── NaN detection ────────────────────────────
-                    # A single NaN backward pass poisons all model
-                    # weights permanently. Skip the batch instead.
                     if torch.isnan(loss) or torch.isinf(loss):
                         nan_count += 1
                         nan_total += 1
@@ -384,8 +503,6 @@ class VLATrainer:
                                 f"Try lowering LR or enabling fp32."
                             )
                             break
-                        # Zero out any accumulated gradients to
-                        # prevent partial NaN contamination
                         self.optimizer.zero_grad()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -418,6 +535,12 @@ class VLATrainer:
                             continue
 
                         self.optimizer.step()
+
+                        # S1 FIX: Step the LR scheduler
+                        if self.scheduler:
+                            self.scheduler.step()
+                            current_lr = self.scheduler.get_last_lr()[0]
+
                         self.optimizer.zero_grad()
                         total_steps += 1
 
@@ -427,7 +550,8 @@ class VLATrainer:
                             f"Epoch {epoch+1}/{num_epochs} | "
                             f"Batch {batch_idx+1}/{num_batches} | "
                             f"Loss: {avg_loss:.4f} | "
-                            f"GradNorm: {grad_norm:.2f}"
+                            f"GradNorm: {grad_norm:.2f} | "
+                            f"LR: {current_lr:.2e}"
                         )
 
                 except RuntimeError as e:
@@ -446,8 +570,6 @@ class VLATrainer:
                 print(f"  ℹ️  Epoch {epoch+1}: {nan_total} NaN batches skipped")
 
             # ── End-of-epoch: flush any remaining accumulated gradients ──
-            # Without this, if num_batches < grad_accum, the optimizer
-            # step never fires and the model never learns.
             remaining = epoch_steps % grad_accum
             if remaining > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -455,6 +577,9 @@ class VLATrainer:
                     self.config.training.max_grad_norm,
                 )
                 self.optimizer.step()
+                if self.scheduler:
+                    self.scheduler.step()
+                    current_lr = self.scheduler.get_last_lr()[0]
                 self.optimizer.zero_grad()
                 total_steps += 1
 
@@ -465,7 +590,8 @@ class VLATrainer:
                 f"  ✅ Epoch {epoch+1}/{num_epochs} complete | "
                 f"Avg Loss: {avg_epoch_loss:.4f} | "
                 f"Time: {epoch_time:.1f}s | "
-                f"Steps so far: {total_steps}"
+                f"Steps so far: {total_steps} | "
+                f"LR: {current_lr:.2e}"
             )
 
             metrics_history.append({
@@ -473,6 +599,7 @@ class VLATrainer:
                 "stage": stage,
                 "loss": avg_epoch_loss,
                 "time": epoch_time,
+                "lr": current_lr,
             })
 
             # Save checkpoint
@@ -546,10 +673,11 @@ class VLATrainer:
         val_samples: Optional[list] = None,
     ) -> Dict[str, Any]:
         """
-        Stage 2: Multi-step imitation with teacher forcing.
+        Stage 2: Multi-step imitation with teacher forcing (C2 FIX).
 
-        Trains on full trajectories where each step's action history
-        includes the ground-truth actions from previous steps.
+        Uses TrajectoryDataset and trajectory_collate_fn for proper
+        trajectory-aware batching. Each trajectory's steps are kept
+        in order with cumulative action history.
         """
         logger.info(f"=== Stage 2: Multi-Step Imitation ({self.config.training.stage2_epochs} epochs) ===")
         logger.info(f"Trajectories: {len(trajectories)}")
@@ -557,30 +685,36 @@ class VLATrainer:
         from models.prompt_builder import PromptBuilder
         prompt_builder = PromptBuilder()
 
-        # Flatten trajectories into step-level samples (with action history)
-        all_steps = []
-        for traj in trajectories:
-            all_steps.extend(traj.steps)
+        # Pre-training diagnostics
+        validate_trajectories(trajectories)
 
-        logger.info(f"Total training steps: {len(all_steps)}")
+        # Filter: only use trajectories with >= 2 steps
+        valid_trajectories = [t for t in trajectories if len(t.steps) >= 2]
+        logger.info(
+            f"Using {len(valid_trajectories)}/{len(trajectories)} trajectories "
+            f"(dropped {len(trajectories) - len(valid_trajectories)} single-step)"
+        )
 
-        dataset = Mind2WebVLADataset(all_steps)
+        # C2 FIX: Use TrajectoryDataset with trajectory_collate_fn
+        dataset = TrajectoryDataset(valid_trajectories)
 
         from functools import partial
         collate = partial(
-            multimodal_collate_fn,
+            trajectory_collate_fn,
             processor=self.model.processor,
             prompt_builder=prompt_builder,
             max_seq_length=self.config.training.max_seq_length,
         )
 
+        # batch_size=1 because each trajectory is already multi-step
+        # shuffle=True to randomize trajectory order per epoch
         dataloader = DataLoader(
             dataset,
-            batch_size=self.config.training.batch_size,
+            batch_size=1,
             shuffle=True,
             collate_fn=collate,
             num_workers=0,
-            drop_last=True,
+            drop_last=False,
         )
 
         return self._run_training_loop(
@@ -667,14 +801,11 @@ def main():
     import sys
 
     # ── SSL certificate bypass ───────────────────────────────
-    # Corporate/proxy environments may inject self-signed certs
-    # that break HuggingFace Hub downloads. Disable verification.
     os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFICATION", "1")
     os.environ.setdefault("CURL_CA_BUNDLE", "")
     os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
     import ssl
     ssl._create_default_https_context = ssl._create_unverified_context
-    # Suppress urllib3 InsecureRequestWarning
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -701,6 +832,7 @@ def main():
     loader = Mind2WebLoader(
         dataset_name=config.data.dataset_name,
         max_dom_nodes=config.data.max_dom_nodes,
+        max_neg_candidates=getattr(config.data, 'max_neg_candidates', 63),
     )
 
     # Initialize trainer
@@ -708,7 +840,6 @@ def main():
 
     # When loading a checkpoint, skip apply_lora() in setup() to
     # prevent double PeftModel wrapping (which causes OOM).
-    # load_lora() creates its own PeftModel wrapper.
     trainer.setup(skip_lora=bool(args.checkpoint))
 
     # Load prior stage checkpoint if specified
@@ -726,8 +857,7 @@ def main():
         )
         log.info(f"Optimizer re-initialized with {len(trainable_params)} trainable params")
 
-    # Run training stages (mutually exclusive)
-    # Data is loaded per-stage to avoid doubling RAM usage.
+    # Run training stages
     if args.stage == 1:
         log.info("Loading training data for Stage 1...")
         train_samples = loader.build_training_examples(

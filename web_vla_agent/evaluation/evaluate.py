@@ -2,9 +2,9 @@
 Evaluation Module for VLA Web Agent — Candidate-Based.
 
 Implements all required metrics:
-  - Candidate accuracy (correct candidate index selection)
+  - Element accuracy (correct element selection by backend_node_id) (C4 FIX)
   - Action accuracy (correct action type)
-  - Task completion rate
+  - Task success rate (M1 FIX)
   - Mean steps to completion
   - Failure mode breakdown
   - Per-action F1
@@ -59,13 +59,14 @@ class VLAEvaluator:
     Evaluate VLA Web Agent on Mind2Web test sets.
 
     Computes all required metrics and produces detailed reports.
-    Uses candidate-based action format.
+    Uses candidate-based action format with element identity comparison (C4 FIX).
     """
 
     def __init__(self, action_types: Optional[List[str]] = None):
         self.action_types = action_types or ["CLICK", "TYPE", "SELECT", "SCROLL"]
         self.results: List[TaskResult] = []
         self.step_results: List[StepResult] = []
+        self.task_results: List[bool] = []      # M1: task-level success tracking
 
     def evaluate_step(
         self,
@@ -73,19 +74,32 @@ class VLAEvaluator:
         ground_truth: Dict[str, Any],
         latency_ms: float = 0.0,
         log_prob: float = 0.0,
+        candidates: Optional[List[Dict]] = None,
+        gt_backend_node_id: int = -1,
     ) -> StepResult:
         """
         Evaluate a single predicted action against ground truth.
+
+        C4 FIX: Compares by element identity (backend_node_id) instead of
+        raw candidate index, which changes with every random shuffle.
         """
         pred_action = predicted.get("action", "").upper()
         gt_action = ground_truth.get("action", "").upper()
 
         action_correct = pred_action == gt_action
 
-        # Candidate comparison
-        pred_candidate = predicted.get("candidate", -1)
-        gt_candidate = ground_truth.get("candidate", -1)
-        candidate_correct = pred_candidate == gt_candidate
+        # C4 FIX: Element identity comparison via backend_node_id
+        pred_idx = predicted.get("candidate", -1)
+        if candidates and gt_backend_node_id >= 0:
+            # Resolve predicted candidate's backend_node_id
+            pred_node_id = -1
+            if isinstance(pred_idx, int) and 0 <= pred_idx < len(candidates):
+                pred_node_id = candidates[pred_idx].get("backend_node_id", -1)
+            candidate_correct = (pred_node_id == gt_backend_node_id)
+        else:
+            # Fallback: compare by raw index (legacy behavior)
+            gt_candidate = ground_truth.get("candidate", -1)
+            candidate_correct = pred_idx == gt_candidate
 
         pred_value = str(predicted.get("value", "")).strip().lower()
         gt_value = str(ground_truth.get("value", "")).strip().lower()
@@ -105,6 +119,20 @@ class VLAEvaluator:
         )
         self.step_results.append(result)
         return result
+
+    def evaluate_trajectory(
+        self,
+        steps: List[StepResult],
+    ) -> bool:
+        """
+        M1 FIX: Evaluate task-level success for a trajectory.
+
+        A task is successful only if ALL steps in the trajectory
+        have full_match=True.
+        """
+        task_success = all(r.full_match for r in steps) if steps else False
+        self.task_results.append(task_success)
+        return task_success
 
     def evaluate_batch(
         self,
@@ -157,12 +185,14 @@ class VLAEvaluator:
                 else:
                     pred_action = action_decoder.normalize(pred_action)
 
-                # Evaluate
+                # C4 FIX: Evaluate with element identity comparison
                 self.evaluate_step(
                     predicted=pred_action,
                     ground_truth=sample.action,
                     latency_ms=latency_ms,
                     log_prob=result.get("avg_log_prob", 0.0),
+                    candidates=sample.candidates,
+                    gt_backend_node_id=sample.gt_backend_node_id,
                 )
 
             except Exception as e:
@@ -187,9 +217,10 @@ class VLAEvaluator:
         Compute all evaluation metrics.
 
         Returns dict with:
-          - candidate_accuracy
+          - element_accuracy (C4 FIX: renamed from candidate_accuracy)
           - action_accuracy
           - full_match_accuracy
+          - task_success_rate (M1 FIX)
           - per_action_f1
           - mean_latency_ms
         """
@@ -206,13 +237,11 @@ class VLAEvaluator:
         }
 
         if valid:
-            metrics["candidate_accuracy"] = sum(1 for r in valid if r.candidate_correct) / len(valid)
+            # C4 FIX: renamed to element_accuracy (primary metric name)
+            metrics["element_accuracy"] = sum(1 for r in valid if r.candidate_correct) / len(valid)
             metrics["action_accuracy"] = sum(1 for r in valid if r.action_correct) / len(valid)
             metrics["value_accuracy"] = sum(1 for r in valid if r.value_correct) / len(valid)
             metrics["full_match_accuracy"] = sum(1 for r in valid if r.full_match) / len(valid)
-
-            # Backward compat alias
-            metrics["element_accuracy"] = metrics["candidate_accuracy"]
 
             latencies = [r.latency_ms for r in valid if r.latency_ms > 0]
             if latencies:
@@ -222,6 +251,11 @@ class VLAEvaluator:
             log_probs = [r.log_prob for r in valid if r.log_prob != 0]
             if log_probs:
                 metrics["mean_log_prob"] = sum(log_probs) / len(log_probs)
+
+        # M1 FIX: Task-level success rate
+        if self.task_results:
+            metrics["task_success_rate"] = sum(1 for t in self.task_results if t) / len(self.task_results)
+            metrics["total_tasks"] = len(self.task_results)
 
         # Per-action metrics
         metrics["per_action"] = self._per_action_metrics(valid)
@@ -283,6 +317,7 @@ class VLAEvaluator:
         """Reset all stored results."""
         self.results.clear()
         self.step_results.clear()
+        self.task_results.clear()
 
     def print_report(self, metrics: Dict[str, Any]) -> None:
         """Print a human-readable evaluation report."""
@@ -292,10 +327,14 @@ class VLAEvaluator:
 
         print(f"\n  Total samples:      {metrics.get('total_samples', 0)}")
         print(f"  Parse success rate: {metrics.get('parse_success_rate', 0):.1%}")
-        print(f"\n  Candidate accuracy: {metrics.get('candidate_accuracy', 0):.1%}")
+        print(f"\n  Element accuracy:   {metrics.get('element_accuracy', 0):.1%}")
         print(f"  Action accuracy:    {metrics.get('action_accuracy', 0):.1%}")
         print(f"  Value accuracy:     {metrics.get('value_accuracy', 0):.1%}")
         print(f"  Full match:         {metrics.get('full_match_accuracy', 0):.1%}")
+
+        # M1: Task success rate
+        if "task_success_rate" in metrics:
+            print(f"\n  Task success rate:  {metrics['task_success_rate']:.1%} ({metrics.get('total_tasks', 0)} tasks)")
 
         if "mean_latency_ms" in metrics:
             print(f"\n  Mean latency:       {metrics['mean_latency_ms']:.0f}ms")

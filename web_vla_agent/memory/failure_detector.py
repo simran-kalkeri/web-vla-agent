@@ -164,5 +164,14 @@ class FailureDetector:
 
     @staticmethod
     def _action_signature(action: Dict[str, Any]) -> str:
-        """Deterministic string signature for an action."""
-        return f"{action.get('action', '?')}|{action.get('element_id', '?')}|{action.get('value', '')}"
+        """Deterministic string signature for an action.
+
+        FIX S3: Use 'candidate' key (with fallback to 'element_id') instead
+        of only 'element_id' which is never populated in candidate-based actions.
+        This allows the loop detector to distinguish actions on different candidates.
+        """
+        return (
+            f"{action.get('action', '?')}"
+            f"|{action.get('candidate', action.get('element_id', '?'))}"
+            f"|{action.get('value', '')}"
+        )
