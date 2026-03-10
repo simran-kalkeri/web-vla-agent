@@ -228,6 +228,7 @@ class VLAModel:
         image: Optional[Any] = None,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
         return_log_probs: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -254,6 +255,9 @@ class VLAModel:
             Screenshot image.
         max_new_tokens : int, optional
         temperature : float, optional
+            Sampling temperature. 0 = greedy, >0 = sampling.
+        top_p : float, optional
+            Nucleus sampling threshold (default from config).
         return_log_probs : bool
             If True, also return token-level log probabilities.
 
@@ -269,6 +273,7 @@ class VLAModel:
 
         max_new_tokens = max_new_tokens or self.config.model.max_new_tokens
         temperature = temperature if temperature is not None else self.config.model.temperature
+        top_p = top_p if top_p is not None else self.config.model.top_p
 
         # Prepare messages — replace image placeholders with actual images
         processed_messages = self._prepare_messages(messages, image)
@@ -317,10 +322,20 @@ class VLAModel:
         input_len = gpu_inputs["input_ids"].shape[-1]
         del inputs  # free CPU-side tensors immediately
 
-        # Structured JSON decoding: ALWAYS use greedy (no sampling).
-        # Sampling causes format drift (arrays, explanations, etc.).
-        do_sample = False
-        gen_temperature = 1.0
+        # ── Sampling strategy ─────────────────────────────────────
+        # When temperature > 0, use nucleus sampling so the model
+        # can escape greedy local maxima (e.g. always predicting
+        # SCROLL because it was the most common safe action in
+        # training).  Greedy decoding (do_sample=False) is a known
+        # cause of degenerate output with LoRA fine-tuned models.
+        if temperature > 0:
+            do_sample = True
+            gen_temperature = temperature
+            gen_top_p = top_p
+        else:
+            do_sample = False
+            gen_temperature = 1.0  # ignored when do_sample=False
+            gen_top_p = 1.0
 
         # torch.inference_mode() is stricter than no_grad:
         # - disables autograd graph construction entirely
@@ -329,10 +344,10 @@ class VLAModel:
             with torch.inference_mode():
                 outputs = self.model.generate(
                     **gpu_inputs,
-                    max_new_tokens=min(max_new_tokens, 128),
+                    max_new_tokens=max_new_tokens,
                     temperature=gen_temperature,
                     do_sample=do_sample,
-                    top_p=1.0,
+                    top_p=gen_top_p,
                     repetition_penalty=self.config.model.repetition_penalty,
                     pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,

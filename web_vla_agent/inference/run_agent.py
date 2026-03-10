@@ -665,19 +665,31 @@ class VLAAgent:
             extra_context=extra_context,
         )
 
-        # Debug
+        # Debug: print full prompt for verification
         num_cands = len(candidates)
         img_size = screenshot_to_use.size if screenshot_to_use else None
-        print(
-            f"  [DEBUG] Candidates: {num_cands}, "
-            f"Screenshot: {img_size}"
+        print(f"  [DEBUG] Candidates: {num_cands}, Screenshot: {img_size}")
+        print(f"  [DEBUG] Sampling: temperature=0.2, top_p=0.9, max_new_tokens=64")
+
+        # Print the text prompt the model will see
+        text_prompt = self.prompt_builder.build_text_prompt(
+            task=task,
+            candidates=candidates,
+            action_history=state.action_history,
+            extra_context=extra_context,
         )
+        print(f"\n===== FULL PROMPT =====")
+        print(text_prompt)
+        print(f"=======================\n")
 
         # Generate with log probabilities
         start = time.time()
         result = self.model.generate(
             messages=messages,
             image=screenshot_to_use,
+            temperature=0.2,
+            top_p=0.9,
+            max_new_tokens=64,
             return_log_probs=True,
         )
         latency_ms = (time.time() - start) * 1000
