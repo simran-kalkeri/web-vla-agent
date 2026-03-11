@@ -123,22 +123,22 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     if not _PRINTED_SAMPLE and len(batch) > 0:
         _PRINTED_SAMPLE = True
         s = batch[0]
-        print("\n========== TRAINING SAMPLE DEBUG ==========")
-        print(f"TASK: {s.task}")
-        print(f"TARGET ACTION: {s.action}")
-        print(f"TARGET INDEX: {s.target_candidate_index}")
-        print(f"\nCANDIDATES ({len(s.candidates)} total):")
+        print("\n========== TRAINING SAMPLE DEBUG ==========", flush=True)
+        print(f"TASK: {s.task}", flush=True)
+        print(f"TARGET ACTION: {s.action}", flush=True)
+        print(f"TARGET INDEX: {s.target_candidate_index}", flush=True)
+        print(f"\nCANDIDATES ({len(s.candidates)} total):", flush=True)
         for c in s.candidates:
             idx = c.get("candidate_index", "?")
             tag = c.get("tag", "")
             text = c.get("text", "")[:60]
             marker = "  <<< TARGET >>>" if idx == s.target_candidate_index else ""
-            print(f"  [{idx}] <{tag}> {text}{marker}")
+            print(f"  [{idx}] <{tag}> {text}{marker}", flush=True)
         if hasattr(s, 'action_history') and s.action_history:
-            print(f"\nACTION HISTORY ({len(s.action_history)} steps):")
+            print(f"\nACTION HISTORY ({len(s.action_history)} steps):", flush=True)
             for h in s.action_history[-3:]:
-                print(f"  {h}")
-        print("==========================================\n")
+                print(f"  {h}", flush=True)
+        print("==========================================\n", flush=True)
 
     all_full_texts = []
     all_images = []
@@ -184,12 +184,15 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
             batch_inputs["image_grid_thw"] = batch_inputs["image_grid_thw"].unsqueeze(0)
 
     # I6: Check for excessive vision tokens
+    # Qwen2-VL merges 2×2 patches after the patch encoder, so actual
+    # LM vision tokens = raw_patches / 4 (merge_size^2 = 4)
     if "image_grid_thw" in batch_inputs:
-        total_vision_tokens = batch_inputs["image_grid_thw"].prod(dim=-1).sum().item()
-        if total_vision_tokens > 5000:
+        raw_patches = batch_inputs["image_grid_thw"].prod(dim=-1).sum().item()
+        actual_tokens = raw_patches // 4  # 2x2 merge
+        if actual_tokens > 1200:
             logger.warning(
-                f"High vision token count: {total_vision_tokens}. "
-                f"Consider lowering image_max_pixels in config."
+                f"High vision token count: {actual_tokens} actual LM tokens "
+                f"({raw_patches} raw patches). Consider lowering image_max_pixels."
             )
 
     # ── Build labels with prompt masking ──
@@ -298,21 +301,21 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     global _COLLATE_LOGGED_FIRST
     if not _COLLATE_LOGGED_FIRST:
         _COLLATE_LOGGED_FIRST = True
-        print("========== COLLATE DIAGNOSTICS (first batch) ==========")
-        print(f"  Batch size: {len(batch)}")
-        print(f"  input_ids shape: {result['input_ids'].shape}")
-        print(f"  labels shape: {result['labels'].shape}")
+        print("========== COLLATE DIAGNOSTICS (first batch) ==========", flush=True)
+        print(f"  Batch size: {len(batch)}", flush=True)
+        print(f"  input_ids shape: {result['input_ids'].shape}", flush=True)
+        print(f"  labels shape: {result['labels'].shape}", flush=True)
         if "pixel_values" in result:
-            print(f"  pixel_values shape: {result['pixel_values'].shape}")
-            print(f"  pixel_values dtype: {result['pixel_values'].dtype}")
+            print(f"  pixel_values shape: {result['pixel_values'].shape}", flush=True)
+            print(f"  pixel_values dtype: {result['pixel_values'].dtype}", flush=True)
         else:
-            print("  pixel_values: MISSING")
+            print("  pixel_values: MISSING", flush=True)
         if "image_grid_thw" in result:
-            print(f"  image_grid_thw shape: {result['image_grid_thw'].shape}")
-            print(f"  image_grid_thw dtype: {result['image_grid_thw'].dtype}")
-            print(f"  image_grid_thw values:\n{result['image_grid_thw']}")
+            print(f"  image_grid_thw shape: {result['image_grid_thw'].shape}", flush=True)
+            print(f"  image_grid_thw dtype: {result['image_grid_thw'].dtype}", flush=True)
+            print(f"  image_grid_thw values:\n{result['image_grid_thw']}", flush=True)
         else:
-            print("  image_grid_thw: MISSING")
+            print("  image_grid_thw: MISSING", flush=True)
 
         # ── Label masking verification ──
         for i in range(min(len(batch), 2)):
@@ -321,29 +324,29 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
             total_count = result["labels"].shape[1]
             pct = 100 * supervised_count / total_count
 
-            print(f"\n  === LABEL DEBUG sample {i} ===")
-            print(f"  Supervised: {supervised_count}/{total_count} ({pct:.1f}%)")
+            print(f"\n  === LABEL DEBUG sample {i} ===", flush=True)
+            print(f"  Supervised: {supervised_count}/{total_count} ({pct:.1f}%)", flush=True)
 
             # Decode the supervised tokens to verify
             supervised_ids = result["labels"][i][supervised_mask]
             supervised_text = processor.tokenizer.decode(
                 supervised_ids.tolist(), skip_special_tokens=False
             )
-            print(f"  Supervised text: '{supervised_text[:300]}'")
+            print(f"  Supervised text: '{supervised_text[:300]}'", flush=True)
 
             # Show <|im_start|> positions for debugging
             im_positions = (result["input_ids"][i] == im_start_id).nonzero(as_tuple=True)[0].tolist()
-            print(f"  <|im_start|> positions: {im_positions}")
-            print(f"  Expected 3 positions (system/user/assistant), got {len(im_positions)}")
+            print(f"  <|im_start|> positions: {im_positions}", flush=True)
+            print(f"  Expected 3 positions (system/user/assistant), got {len(im_positions)}", flush=True)
 
             if pct > 10:
-                print(f"  ⚠️  WARNING: {pct:.1f}% supervised — label masking likely broken!")
+                print(f"  ⚠️  WARNING: {pct:.1f}% supervised — label masking likely broken!", flush=True)
             elif pct < 0.1:
-                print(f"  ⚠️  WARNING: {pct:.1f}% supervised — everything may be masked!")
+                print(f"  ⚠️  WARNING: {pct:.1f}% supervised — everything may be masked!", flush=True)
             else:
-                print(f"  ✅ Label masking looks correct ({pct:.1f}%)")
+                print(f"  ✅ Label masking looks correct ({pct:.1f}%)", flush=True)
 
-        print("=======================================================")
+        print("=======================================================", flush=True)
 
     return result
 

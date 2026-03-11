@@ -24,6 +24,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
+# Prevent DecompressionBombWarning on large Mind2Web screenshots
+# (some are >100MP). PIL warns but still opens them; however a stricter
+# env or future PIL version could refuse. Allow up to 200MP safely.
+Image.MAX_IMAGE_PIXELS = 200_000_000
 
 logger = logging.getLogger(__name__)
 
