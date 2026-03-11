@@ -314,12 +314,29 @@ class Mind2WebLoader:
         if not Mind2WebLoader._LOGGED_FIRST_CANDIDATE and pos_candidates:
             Mind2WebLoader._LOGGED_FIRST_CANDIDATE = True
             first = pos_candidates[0]
-            logger.info("═══ CANDIDATE FORMAT DIAGNOSTICS ═══")
-            logger.info(f"  pos_candidates length: {len(pos_candidates)}")
-            logger.info(f"  neg_candidates length: {len(neg_candidates)}")
-            logger.info(f"  First pos_candidate type: {type(first).__name__}")
-            logger.info(f"  First pos_candidate preview: {str(first)[:300]}")
-            logger.info("═════════════════════════════════════")
+            print("\n═══ CANDIDATE FORMAT DIAGNOSTICS ═══")
+            print(f"  pos_candidates length: {len(pos_candidates)}")
+            print(f"  neg_candidates length: {len(neg_candidates)}")
+            print(f"  First pos_candidate type: {type(first).__name__}")
+            print(f"  First pos_candidate preview: {str(first)[:300]}")
+            # Dump raw structure for debugging
+            print("\n=== RAW CANDIDATE STRUCTURE ===")
+            raw_first = first
+            if isinstance(raw_first, str):
+                try:
+                    raw_first = json.loads(raw_first)
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(raw_first, list) and len(raw_first) == 2:
+                raw_first = raw_first[1]
+                if isinstance(raw_first, str):
+                    try:
+                        raw_first = json.loads(raw_first)
+                    except json.JSONDecodeError:
+                        pass
+            print(json.dumps(raw_first, indent=2, default=str)[:1000])
+            print("================================")
+            print("═════════════════════════════════════\n")
 
         if not pos_candidates:
             return [], -1, -1
@@ -430,21 +447,63 @@ class Mind2WebLoader:
                 tag = candidate.get("tagName", "div")
             tag = tag.lower()
 
-            text = candidate.get("text", "")
-            if not text:
-                text = candidate.get("value", "")
-
-            # Parse attributes — Mind2Web stores them as a nested JSON string
+            # Parse attributes FIRST — Mind2Web stores them as a nested JSON string
+            # We need these to extract text, so parse early.
             attributes = candidate.get("attributes", {})
             if isinstance(attributes, str):
                 try:
                     attributes = json.loads(attributes)
                 except json.JSONDecodeError:
                     attributes = self._parse_attr_string(attributes)
+            if not isinstance(attributes, dict):
+                attributes = {}
+
+            # ── AGGRESSIVE TEXT EXTRACTION ──────────────────────
+            # Mind2Web stores text in various places depending on version.
+            # Check ALL possible locations in priority order.
+            text = (
+                # Top-level keys
+                candidate.get("text", "")
+                or candidate.get("value", "")
+                or candidate.get("innerText", "")
+                or candidate.get("textContent", "")
+                or candidate.get("__text", "")
+            )
+
+            # If still empty, check inside parsed attributes dict
+            if not text and attributes:
+                text = (
+                    attributes.get("innerText", "")
+                    or attributes.get("textContent", "")
+                    or attributes.get("aria-label", "")
+                    or attributes.get("placeholder", "")
+                    or attributes.get("title", "")
+                    or attributes.get("alt", "")
+                    or attributes.get("value", "")
+                    or attributes.get("name", "")
+                    or attributes.get("label", "")
+                    or attributes.get("data-label", "")
+                    or attributes.get("data-text", "")
+                )
+
+            # Last resort: concatenate all non-empty short attribute values
+            # to build some textual representation
+            if not text and attributes:
+                attr_texts = []
+                for k, v in attributes.items():
+                    if k in ("class", "id", "style", "href", "src",
+                             "bounding_box_rect", "backend_node_id",
+                             "data-backend-node-id"):
+                        continue  # Skip non-semantic attributes
+                    sv = str(v).strip()
+                    if sv and len(sv) < 100:
+                        attr_texts.append(sv)
+                if attr_texts:
+                    text = " | ".join(attr_texts[:3])  # Take first 3
 
             # Extract backend_node_id (may be in attributes dict or top-level)
             backend_node_id = candidate.get("backend_node_id", -1)
-            if backend_node_id == -1 and isinstance(attributes, dict):
+            if backend_node_id == -1:
                 try:
                     backend_node_id = int(attributes.get("backend_node_id", -1))
                 except (ValueError, TypeError):
@@ -452,20 +511,19 @@ class Mind2WebLoader:
 
             # I4: Extract bounding_box_rect for spatial grounding
             bbox = None
-            if isinstance(attributes, dict):
-                bbox_str = attributes.get("bounding_box_rect", "")
-                if bbox_str:
-                    try:
-                        parts = [float(x) for x in str(bbox_str).split(",")[:4]]
-                        if len(parts) == 4:
-                            bbox = parts  # [x, y, w, h]
-                    except (ValueError, TypeError):
-                        pass
+            bbox_str = attributes.get("bounding_box_rect", "")
+            if bbox_str:
+                try:
+                    parts = [float(x) for x in str(bbox_str).split(",")[:4]]
+                    if len(parts) == 4:
+                        bbox = parts  # [x, y, w, h]
+                except (ValueError, TypeError):
+                    pass
 
             return {
                 "tag": tag,
                 "text": str(text)[:200],
-                "attributes": attributes if isinstance(attributes, dict) else {},
+                "attributes": attributes,
                 "backend_node_id": backend_node_id,
                 "bbox": bbox,
                 "_is_positive": is_positive,

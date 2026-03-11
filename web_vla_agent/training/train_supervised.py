@@ -193,31 +193,92 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
             )
 
     # ── Build labels with prompt masking ──
+    # Strategy: find the assistant turn in the tokenized output and mask
+    # everything BEFORE the assistant's JSON content with -100.
+    #
+    # Qwen2-VL chat template format:
+    #   <|im_start|>system\n...<|im_end|>\n
+    #   <|im_start|>user\n...<|im_end|>\n
+    #   <|im_start|>assistant\n{"action":...}<|im_end|>\n
+    #
+    # We need to supervise ONLY the JSON content after "assistant\n".
     labels = batch_inputs["input_ids"].clone()
 
+    # Get special token IDs
     im_start_id = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
-    assistant_header_ids = processor.tokenizer.encode(
-        "<|im_start|>assistant\n", add_special_tokens=False
+    im_end_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+    # Tokenize just "assistant\n" to find its token IDs for boundary search
+    # (Don't include <|im_start|> here — it's a special token that .encode()
+    # may not reproduce correctly)
+    assistant_role_ids = processor.tokenizer.encode(
+        "assistant\n", add_special_tokens=False
     )
-    header_len = len(assistant_header_ids)
 
     for i in range(labels.shape[0]):
         ids = batch_inputs["input_ids"][i]
-        positions = (ids == im_start_id).nonzero(as_tuple=True)[0]
+        ids_list = ids.tolist()
+
+        # Find all <|im_start|> positions
+        positions = (ids == im_start_id).nonzero(as_tuple=True)[0].tolist()
 
         if len(positions) >= 3:
-            assistant_start = positions[-1].item()
-            content_start = assistant_start + header_len
-            labels[i, :content_start] = -100
+            # Third <|im_start|> = assistant turn (system=0, user=1, assistant=2)
+            assistant_im_start = positions[2]
         elif len(positions) >= 1:
-            assistant_start = positions[-1].item()
-            content_start = assistant_start + header_len
-            labels[i, :content_start] = -100
+            # Fallback: use the last <|im_start|>
+            assistant_im_start = positions[-1]
         else:
-            print(f"WARNING: No <|im_start|> found in sample {i}, masking all tokens")
+            # No <|im_start|> found at all — mask everything
+            print(f"ERROR sample {i}: no <|im_start|> tokens found. "
+                  f"Token IDs sample: {ids_list[:20]}")
             labels[i, :] = -100
+            pad_mask = batch_inputs["attention_mask"][i] == 0
+            labels[i, pad_mask] = -100
+            continue
 
-        # Mask padding tokens
+        # Now find the exact content start: scan forward from assistant_im_start
+        # to find "assistant\n" tokens, then content starts right after.
+        content_start = None
+
+        # Method 1: Search for the assistant_role_ids sequence after <|im_start|>
+        search_start = assistant_im_start + 1  # skip <|im_start|> itself
+        search_end = min(search_start + 10, len(ids_list))  # look within 10 tokens
+        for j in range(search_start, search_end):
+            # Check if assistant_role_ids matches starting at position j
+            if ids_list[j:j + len(assistant_role_ids)] == assistant_role_ids:
+                content_start = j + len(assistant_role_ids)
+                break
+
+        # Method 2: If pattern match failed, find the newline token after <|im_start|>
+        if content_start is None:
+            newline_ids = processor.tokenizer.encode("\n", add_special_tokens=False)
+            if newline_ids:
+                newline_id = newline_ids[0]
+                for j in range(search_start, search_end):
+                    if ids_list[j] == newline_id:
+                        content_start = j + 1
+                        break
+
+        # Method 3: Last resort — use a fixed offset of 3 tokens
+        # (<|im_start|> + "assistant" + "\n")
+        if content_start is None:
+            content_start = assistant_im_start + 3
+            print(f"WARNING sample {i}: assistant boundary not found precisely, "
+                  f"using offset=3 from position {assistant_im_start}")
+
+        # Mask everything before assistant content
+        labels[i, :content_start] = -100
+
+        # Also mask everything AFTER <|im_end|> in the assistant turn
+        # (the response should end with <|im_end|>\n, don't supervise those)
+        end_positions = (ids[content_start:] == im_end_id).nonzero(as_tuple=True)[0]
+        if len(end_positions) > 0:
+            # First <|im_end|> after content_start = end of assistant response
+            assistant_end = content_start + end_positions[0].item()
+            labels[i, assistant_end:] = -100
+
+        # Always mask padding
         pad_mask = batch_inputs["attention_mask"][i] == 0
         labels[i, pad_mask] = -100
 
@@ -233,7 +294,7 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     if "image_grid_thw" in batch_inputs:
         result["image_grid_thw"] = batch_inputs["image_grid_thw"]
 
-    # First-batch diagnostics
+    # First-batch diagnostics — verify label masking is correct
     global _COLLATE_LOGGED_FIRST
     if not _COLLATE_LOGGED_FIRST:
         _COLLATE_LOGGED_FIRST = True
@@ -252,9 +313,36 @@ def multimodal_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
             print(f"  image_grid_thw values:\n{result['image_grid_thw']}")
         else:
             print("  image_grid_thw: MISSING")
-        num_target = (result["labels"] != -100).sum().item()
-        total = result["labels"].numel()
-        print(f"  Supervised tokens: {num_target}/{total} ({100*num_target/total:.1f}%)")
+
+        # ── Label masking verification ──
+        for i in range(min(len(batch), 2)):
+            supervised_mask = result["labels"][i] != -100
+            supervised_count = supervised_mask.sum().item()
+            total_count = result["labels"].shape[1]
+            pct = 100 * supervised_count / total_count
+
+            print(f"\n  === LABEL DEBUG sample {i} ===")
+            print(f"  Supervised: {supervised_count}/{total_count} ({pct:.1f}%)")
+
+            # Decode the supervised tokens to verify
+            supervised_ids = result["labels"][i][supervised_mask]
+            supervised_text = processor.tokenizer.decode(
+                supervised_ids.tolist(), skip_special_tokens=False
+            )
+            print(f"  Supervised text: '{supervised_text[:300]}'")
+
+            # Show <|im_start|> positions for debugging
+            im_positions = (result["input_ids"][i] == im_start_id).nonzero(as_tuple=True)[0].tolist()
+            print(f"  <|im_start|> positions: {im_positions}")
+            print(f"  Expected 3 positions (system/user/assistant), got {len(im_positions)}")
+
+            if pct > 10:
+                print(f"  ⚠️  WARNING: {pct:.1f}% supervised — label masking likely broken!")
+            elif pct < 0.1:
+                print(f"  ⚠️  WARNING: {pct:.1f}% supervised — everything may be masked!")
+            else:
+                print(f"  ✅ Label masking looks correct ({pct:.1f}%)")
+
         print("=======================================================")
 
     return result
@@ -267,12 +355,17 @@ def trajectory_collate_fn(batch, processor, prompt_builder, max_seq_length=2048)
     """
     Collate trajectories into interleaved step-level batches (C2 FIX).
 
-    Each item in batch is a Mind2WebTrajectory. This function extracts
-    all steps across trajectories, then delegates to multimodal_collate_fn.
+    Each item in batch is a Mind2WebTrajectory. Steps are interleaved
+    round-robin across trajectories for balanced gradient signal:
+      A0, B0, A1, B1, A2, B2, ...  (not A0, A1, A2, B0, B1, B2)
     """
+    # Interleave steps across trajectories
+    max_len = max((len(traj.steps) for traj in batch), default=0)
     all_steps = []
-    for traj in batch:
-        all_steps.extend(traj.steps)
+    for step_pos in range(max_len):
+        for traj in batch:
+            if step_pos < len(traj.steps):
+                all_steps.append(traj.steps[step_pos])
 
     # Delegate to the standard multimodal collate
     return multimodal_collate_fn(
@@ -655,8 +748,10 @@ class VLATrainer:
             batch_size=self.config.training.batch_size,
             shuffle=True,
             collate_fn=collate,
-            num_workers=0,
+            num_workers=4,
             drop_last=True,
+            pin_memory=True,        # add this
+            persistent_workers=True
         )
 
         return self._run_training_loop(
@@ -713,8 +808,10 @@ class VLATrainer:
             batch_size=1,
             shuffle=True,
             collate_fn=collate,
-            num_workers=0,
+            num_workers=4,
             drop_last=False,
+            pin_memory=True,
+            persistent_workers=True,
         )
 
         return self._run_training_loop(
@@ -768,8 +865,16 @@ class VLATrainer:
                         pred = decoder.normalize(pred)
                         if pred.get("action") == gt.get("action"):
                             correct_actions += 1
-                        if pred.get("candidate") == gt.get("candidate"):
-                            correct_candidates += 1
+
+                        # C4 FIX: compare by backend_node_id, not candidate index
+                        pred_idx = pred.get("candidate", -1)
+                        if isinstance(pred_idx, int) and 0 <= pred_idx < len(sample.candidates):
+                            pred_node_id = sample.candidates[pred_idx].get(
+                                "backend_node_id", -2
+                            )
+                            gt_node_id = getattr(sample, "gt_backend_node_id", -3)
+                            if pred_node_id == gt_node_id and gt_node_id >= 0:
+                                correct_candidates += 1
 
                     total += 1
                 except Exception:

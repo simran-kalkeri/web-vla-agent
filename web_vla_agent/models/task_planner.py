@@ -51,8 +51,9 @@ class TaskPlanner:
             )
             text = result.get("text", "")
 
-            # Extract JSON array from output
-            match = re.search(r'\[.*\]', text, re.DOTALL)
+            # Extract JSON array from output — non-greedy to avoid
+            # matching across multiple bracket pairs in the response
+            match = re.search(r'\[.*?\]', text, re.DOTALL)
             if match:
                 subgoals = json.loads(match.group())
                 if isinstance(subgoals, list) and all(isinstance(s, str) for s in subgoals):
@@ -72,10 +73,15 @@ class TaskPlanner:
     ) -> str:
         """
         Returns the current active subgoal based on progress.
-        Simple heuristic: divide steps evenly across subgoals.
+
+        Paces subgoal advancement by dividing total_steps evenly across
+        subgoals, so with total_steps=30 and 3 subgoals, advancement
+        happens at steps 0, 10, 20.
         """
         if not subgoals:
             return ""
-        progress = completed_steps / max(total_steps, 1)
-        idx = min(int(progress * len(subgoals)), len(subgoals) - 1)
+        n = len(subgoals)
+        # Advance one subgoal every (total_steps / n) steps
+        steps_per_subgoal = max(total_steps / n, 1)
+        idx = min(int(completed_steps / steps_per_subgoal), n - 1)
         return subgoals[idx]
