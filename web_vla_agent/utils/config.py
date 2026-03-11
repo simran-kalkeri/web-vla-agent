@@ -34,8 +34,10 @@ class ModelConfig:
         default_factory=lambda: ["CLICK", "TYPE", "SELECT", "SCROLL"]
     )
     # Image resolution limits for Qwen2-VL processor
+    # 200704 = 256 * 28 * 28 → ~450 vision tokens (after 2×2 merge)
+    # Must fit within 2048 budget alongside 64 candidates (~960 tokens)
     image_min_pixels: int = 43904      # 56 * 28 * 28 — ~150 vision tokens min
-    image_max_pixels: int = 802816     # 1024 * 28 * 28 — ~800 vision tokens max (I6)
+    image_max_pixels: int = 200704     # 256 * 28 * 28 — ~450 vision tokens max
 
 
 @dataclass

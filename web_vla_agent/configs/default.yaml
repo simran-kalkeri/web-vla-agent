@@ -18,9 +18,12 @@ model:
   lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
   quantization_bits: 4
 
-  # Image resolution limits for Qwen2-VL processor (I6: increased for better text readability)
+  # Image resolution limits for Qwen2-VL processor
+  # With 64 candidates (~960 tokens) + task/history (~200 tokens),
+  # vision must fit within 2048 - 1160 = ~888 token budget.
+  # 200704 = 256 * 28 * 28 → ~450 vision tokens (after 2×2 merge).
   image_min_pixels: 43904      # 56 * 28 * 28 — ~150 vision tokens min
-  image_max_pixels: 802816     # 1024 * 28 * 28 — ~800 vision tokens max
+  image_max_pixels: 200704     # 256 * 28 * 28 — ~450 vision tokens max
 
   # Action types
   action_types: ["CLICK", "TYPE", "SELECT", "SCROLL", "DONE"]
@@ -35,8 +38,8 @@ training:
 
   learning_rate: 2.0e-4
   weight_decay: 0.01
-  batch_size: 2
-  gradient_accumulation_steps: 4
+  batch_size: 1
+  gradient_accumulation_steps: 8  # effective batch = 8
   warmup_ratio: 0.1
   max_grad_norm: 1.0
   seed: 42
