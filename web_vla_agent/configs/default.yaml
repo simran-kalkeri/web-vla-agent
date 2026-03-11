@@ -27,7 +27,7 @@ model:
 
 training:
   # Stage 1: Single-step imitation
-  stage1_epochs: 5
+  stage1_epochs: 3
   # Stage 2: Multi-step imitation (aligned to 5)
   stage2_epochs: 5
   # Stage 3 (optional): RL fine-tuning
