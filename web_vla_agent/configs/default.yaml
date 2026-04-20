@@ -67,7 +67,7 @@ data:
   max_candidates: 64        # standardized candidate count
 
 environment:
-  headless: true
+  headless: false
   viewport_width: 1280
   viewport_height: 720
   timeout_ms: 30000
@@ -88,3 +88,22 @@ logging:
   log_dir: "logs"
   use_wandb: false
   wandb_project: "web-vla-agent"
+
+# ── Groq cloud inference backend ─────────────────────────────────────────────
+# Used when --backend groq is passed to inference/run_agent.py.
+# Requires GROQ_API_KEY environment variable (or in a .env file).
+#
+# Recommended vision-capable models:
+#   meta-llama/llama-4-scout-17b-16e-instruct   (fast, multimodal) ← default
+#   meta-llama/llama-4-maverick-17b-128e-instruct
+#   llama-3.2-11b-vision-preview
+#   llama-3.2-90b-vision-preview
+#
+# Text-only (no screenshot) alternatives:
+#   llama-3.3-70b-versatile
+#   llama-3.1-8b-instant
+groq:
+  model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  max_new_tokens: 256
+  temperature: 0.2
+  top_p: 0.9

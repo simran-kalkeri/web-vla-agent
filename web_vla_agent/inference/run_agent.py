@@ -79,10 +79,12 @@ class VLAAgent:
         config: Optional[VLAConfig] = None,
         device: str = "cuda",
         use_mock: bool = False,
+        backend: str = "local",
     ):
         self.config = config or load_config()
         self.device = device
         self.use_mock = use_mock
+        self.backend = backend.lower()   # "local" or "groq"
         self.output_dir = None   # Set externally for screenshot saving
 
         self.model = None
@@ -121,15 +123,23 @@ class VLAAgent:
         self._subgoals: List[str] = []
 
     def load_model(self, checkpoint: Optional[str] = None) -> None:
-        """Load the VLA model and optionally LoRA weights."""
-        from models.vla_model import VLAModel
-
-        self.model = VLAModel(config=self.config, device=self.device)
-        self.model.load()
-
-        if checkpoint:
-            self.model.load_lora(checkpoint)
-            logger.info(f"Loaded checkpoint: {checkpoint}")
+        """Load the VLA model (local Qwen2-VL) or initialise Groq backend."""
+        if self.backend == "groq":
+            from models.groq_model import GroqModel
+            self.model = GroqModel(config=self.config)
+            self.model.load()
+            if checkpoint:
+                logger.warning(
+                    "--checkpoint is ignored when --backend groq is used "
+                    "(Groq runs cloud weights)."
+                )
+        else:
+            from models.vla_model import VLAModel
+            self.model = VLAModel(config=self.config, device=self.device)
+            self.model.load()
+            if checkpoint:
+                self.model.load_lora(checkpoint)
+                logger.info(f"Loaded checkpoint: {checkpoint}")
 
     async def run_task(
         self,
@@ -194,6 +204,15 @@ class VLAAgent:
 
             for step in range(max_steps):
                 logger.info(f"\n--- Step {step + 1}/{max_steps} ---")
+
+                # ── CAPTCHA detection ────────────────────────────
+                # Detect Google bot-check / reCAPTCHA pages and pause
+                # so the human can solve manually (requires headless=false).
+                captcha_paused = await self._handle_captcha_if_needed(state)
+                if captcha_paused:
+                    # Re-extract state after human solved CAPTCHA
+                    state = await self.env.extract_state()
+                    logger.info("Resuming after CAPTCHA solved")
 
                 # Check error/done conditions
                 if state.error:
@@ -818,6 +837,88 @@ class VLAAgent:
             "error": error,
         }
 
+    # ── CAPTCHA handling ─────────────────────────────────────────
+
+    # Known CAPTCHA / bot-check URL patterns
+    _CAPTCHA_URL_PATTERNS = (
+        "google.com/sorry",           # Google bot-check
+        "recaptcha",                  # reCAPTCHA embed
+        "challenges.cloudflare.com",  # Cloudflare turnstile
+        "captcha",                    # generic
+        "robot",                      # generic
+        "bot-check",                  # generic
+        "are-you-a-human",            # generic
+    )
+    _CAPTCHA_TITLE_PATTERNS = (
+        "unusual traffic",
+        "not a robot",
+        "captcha",
+        "verify you",
+        "security check",
+        "blocked",
+        "just a moment",             # Cloudflare
+    )
+
+    async def _handle_captcha_if_needed(
+        self,
+        state: BrowserState,
+    ) -> bool:
+        """
+        Detect CAPTCHA / bot-check pages and pause for human intervention.
+
+        Detection: checks current URL and page title against known patterns.
+
+        If detected (and headless=False so the browser is visible):
+          - Prints a clear notice with the URL
+          - Blocks on input() so the human can solve the CAPTCHA manually
+          - Returns True so the caller re-extracts state afterward
+
+        If NOT detected or browser is headless (can't interact):
+          - Returns False immediately (no-op)
+
+        Returns
+        -------
+        bool
+            True if CAPTCHA was detected and human was prompted to solve it.
+        """
+        url_lower = (state.url or "").lower()
+        title_lower = (state.page_title or "").lower()
+
+        url_match = any(p in url_lower for p in self._CAPTCHA_URL_PATTERNS)
+        title_match = any(p in title_lower for p in self._CAPTCHA_TITLE_PATTERNS)
+
+        if not (url_match or title_match):
+            return False
+
+        # Headless browsers can't show the CAPTCHA to the user
+        if self.config.environment.headless:
+            logger.warning(
+                "CAPTCHA detected but browser is headless — cannot interact. "
+                "Set environment.headless: false in default.yaml to enable "
+                "manual CAPTCHA solving."
+            )
+            return False
+
+        print("\n" + "=" * 60)
+        print("  🔒 CAPTCHA / bot-check detected!")
+        print(f"  URL: {state.url}")
+        print(f"  Page: {state.page_title}")
+        print()
+        print("  The browser window is open in front of you.")
+        print("  Please solve the CAPTCHA manually, then come back here")
+        print("  and press ENTER to let the agent continue.")
+        print("=" * 60)
+
+        # Block until human presses Enter
+        # Use asyncio to avoid blocking the event loop on Windows
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, input, "  → Press ENTER when done: ")
+
+        print("  ✅ Resuming agent...\n")
+        return True
+
+
 
 # ── Entry point ──────────────────────────────────────────────
 
@@ -829,7 +930,21 @@ def main():
     parser.add_argument("--url", type=str, required=True, help="Starting URL")
     parser.add_argument("--task", type=str, required=True, help="Task instruction")
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--backend", type=str, default="local",
+        choices=["local", "groq"],
+        help=(
+            "Inference backend.  "
+            "'local' loads Qwen2-VL on this machine (needs GPU+RAM).  "
+            "'groq' routes through the Groq API (needs GROQ_API_KEY, zero local GPU)."
+        ),
+    )
+    parser.add_argument(
+        "--groq-model", type=str, default=None,
+        help="Override the Groq model name (e.g. llama-3.2-11b-vision-preview).",
+    )
+    parser.add_argument("--device", type=str, default="cpu",
+                        help="Device for local backend (default: cpu; use cuda for GPU).")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--mock", action="store_true", help="Use mock browser")
     parser.add_argument("--max-steps", type=int, default=None)
@@ -841,6 +956,27 @@ def main():
     log = get_logger("vla.agent")
 
     config = load_config(args.config)
+
+    # Apply --groq-model override
+    if args.groq_model:
+        config.groq.model = args.groq_model
+
+    # Groq backend: load .env first, then check for the key
+    if args.backend == "groq":
+        import os
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()  # loads .env from cwd or any parent directory
+        except ImportError:
+            pass
+        if not os.environ.get("GROQ_API_KEY"):
+            print(
+                "\n⚠️  GROQ_API_KEY not found in environment.\n"
+                "   Set it before running:\n"
+                "     $env:GROQ_API_KEY='gsk_...'      # PowerShell\n"
+                "     export GROQ_API_KEY='gsk_...'    # bash/zsh\n"
+                "   Or add it to a .env file in the project root.\n"
+            )
 
     # Setup output directory for screenshots
     output_dir = None
@@ -854,6 +990,7 @@ def main():
         config=config,
         device=args.device,
         use_mock=args.mock,
+        backend=args.backend,
     )
     agent.output_dir = output_dir
     agent.load_model(checkpoint=args.checkpoint)

@@ -74,7 +74,7 @@ class DataConfig:
 
 @dataclass
 class EnvironmentConfig:
-    headless: bool = True
+    headless: bool = False
     viewport_width: int = 1280
     viewport_height: int = 720
     timeout_ms: int = 30000
@@ -105,6 +105,16 @@ class LoggingConfig:
 
 
 @dataclass
+class GroqConfig:
+    """Settings for the Groq cloud inference backend."""
+    # Vision-capable model recommended for web agent tasks
+    model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    max_new_tokens: int = 256
+    temperature: float = 0.2
+    top_p: float = 0.9
+
+
+@dataclass
 class VLAConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -113,11 +123,12 @@ class VLAConfig:
     uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    groq: GroqConfig = field(default_factory=GroqConfig)
 
 
 _CONFIG_TYPES = (
     ModelConfig, TrainingConfig, DataConfig, EnvironmentConfig,
-    UncertaintyConfig, EvaluationConfig, LoggingConfig,
+    UncertaintyConfig, EvaluationConfig, LoggingConfig, GroqConfig,
 )
 
 
@@ -146,7 +157,7 @@ def load_config(yaml_path: Optional[str] = None) -> VLAConfig:
             yaml_path = str(candidate)
 
     if yaml_path and Path(yaml_path).exists():
-        with open(yaml_path, "r") as fh:
+        with open(yaml_path, "r", encoding="utf-8") as fh:
             overrides = yaml.safe_load(fh) or {}
         _update_dataclass(cfg, overrides)
 
